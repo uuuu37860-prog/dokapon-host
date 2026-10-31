@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -13,11 +14,46 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import java.io.File
+import java.security.SecureRandom
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var info: TextView
     private lateinit var startBtn: Button
+    private lateinit var roomText: TextView
+    private lateinit var urlEdit: EditText
+
+    private fun prefs() = getSharedPreferences("dokapon", MODE_PRIVATE)
+
+    private fun newRoom(): String {
+        val a = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        val r = SecureRandom()
+        return (1..6).map { a[r.nextInt(a.length)] }.joinToString("")
+    }
+
+    private fun room(): String {
+        var r = prefs().getString("room", null)
+        if (r == null) {
+            r = newRoom()
+            prefs().edit().putString("room", r).apply()
+        }
+        return r
+    }
+
+    private fun pageUrl(): String {
+        val saved = prefs().getString("page", null)
+        return saved ?: "https://bom979229-boop.github.io/Dokapon/play.html"
+    }
+
+    private fun shareLink() {
+        val url = urlEdit.text.toString().trim()
+        prefs().edit().putString("page", url).apply()
+        val sep = if (url.contains("?")) "&" else "?"
+        val link = "$url${sep}room=${room()}"
+        val send = Intent(Intent.ACTION_SEND).setType("text/plain")
+            .putExtra(Intent.EXTRA_TEXT, "เข้าห้อง Dokapon ด้วยกัน: $link")
+        startActivity(Intent.createChooser(send, "แชร์ลิงก์ห้อง"))
+    }
 
     private val pickGame =
         registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -57,6 +93,29 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { startGame() }
         }
         root.addView(startBtn)
+
+        root.addView(TextView(this).apply {
+            text = "ห้องสำหรับเพื่อน"
+            textSize = 16f
+            setTextColor(Color.BLACK)
+            setPadding(0, dp(20), 0, 0)
+        })
+        roomText = TextView(this).apply { textSize = 24f; text = "รหัสห้อง: " + room() }
+        root.addView(roomText)
+        root.addView(Button(this).apply {
+            text = "สุ่มรหัสห้องใหม่"
+            setOnClickListener {
+                prefs().edit().putString("room", newRoom()).apply()
+                roomText.text = "รหัสห้อง: " + room()
+            }
+        })
+        root.addView(TextView(this).apply { text = "ลิงก์หน้าเว็บของเพื่อน (หน้า play.html)"; textSize = 13f })
+        urlEdit = EditText(this).apply { setText(pageUrl()); textSize = 13f; setSingleLine(true) }
+        root.addView(urlEdit)
+        root.addView(Button(this).apply {
+            text = "แชร์ลิงก์ห้องให้เพื่อน"
+            setOnClickListener { shareLink() }
+        })
 
         info = TextView(this).apply { textSize = 14f; setPadding(0, dp(16), 0, 0) }
         root.addView(info)

@@ -1,32 +1,452 @@
 package com.bom.dokapon
 
 import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.swordfish.libretrodroid.GLRetroView
 import com.swordfish.libretrodroid.GLRetroViewData
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONObject
+import org.webrtc.DataChannel
+import org.webrtc.DefaultVideoDecoderFactory
+import org.webrtc.DefaultVideoEncoderFactory
+import org.webrtc.EglBase
+import org.webrtc.IceCandidate
+import org.webrtc.MediaConstraints
+import org.webrtc.MediaStream
+import org.webrtc.PeerConnection
+import org.webrtc.PeerConnectionFactory
+import org.webrtc.RtpReceiver
+import org.webrtc.ScreenCapturerAndroid
+import org.webrtc.SdpObserver
+import org.webrtc.SessionDescription
+import org.webrtc.SurfaceTextureHelper
+import org.webrtc.VideoSource
+import org.webrtc.VideoTrack
 import java.io.File
+import java.util.concurrent.TimeUnit
+
+/**
+ * รหัสปุ่มแบบ RetroPad ที่หน้าเว็บของเพื่อนส่งมา -> รหัสปุ่มจอยของ Android
+ * ทดสอบแล้ว: ✕ ต้องเป็น BUTTON_B, ○ เป็น BUTTON_A, □ เป็น BUTTON_Y, △ เป็น BUTTON_X
+ */
+object PadMap {
+    fun cross() = KeyEvent.KEYCODE_BUTTON_B
+    fun circle() = KeyEvent.KEYCODE_BUTTON_A
+    fun square() = KeyEvent.KEYCODE_BUTTON_Y
+    fun triangle() = KeyEvent.KEYCODE_BUTTON_X
+
+    fun code(i: Int): Int? = when (i) {
+        0 -> cross()
+        1 -> square()
+        2 -> KeyEvent.KEYCODE_BUTTON_SELECT
+        3 -> KeyEvent.KEYCODE_BUTTON_START
+        4 -> KeyEvent.KEYCODE_DPAD_UP
+        5 -> KeyEvent.KEYCODE_DPAD_DOWN
+        6 -> KeyEvent.KEYCODE_DPAD_LEFT
+        7 -> KeyEvent.KEYCODE_DPAD_RIGHT
+        8 -> circle()
+        9 -> triangle()
+        10 -> KeyEvent.KEYCODE_BUTTON_L1
+        11 -> KeyEvent.KEYCODE_BUTTON_R1
+        12 -> KeyEvent.KEYCODE_BUTTON_L2
+        13 -> KeyEvent.KEYCODE_BUTTON_R2
+        else -> null
+    }
+}
+
+/** Foreground service จำเป็นสำหรับการจับภาพหน้าจอบน Android 10 ขึ้นไป */
+class StreamService : Service() {
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val channelId = "stream"
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.createNotificationChannel(NotificationChannel(channelId, "Streaming", NotificationManager.IMPORTANCE_LOW))
+        val n: Notification = Notification.Builder(this, channelId)
+            .setContentTitle("Dokapon Host")
+            .setContentText("กำลังสตรีมเกมให้เพื่อน")
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .build()
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(1, n)
+        }
+        return START_NOT_STICKY
+    }
+}
+
+/** ติดต่อเซิร์ฟเวอร์จับคู่ฟรีของ PeerJS แบบดิบ ๆ ผ่าน WebSocket (ใช้เป็นแค่ตัวส่งต่อข้อความ) */
+class Signaling(private val id: String, private val listener: Listener) {
+    interface Listener {
+        fun onMessage(type: String, src: String?, payload: JSONObject?)
+    }
+
+    private val client = OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).build()
+    private val main = Handler(Looper.getMainLooper())
+    private var ws: WebSocket? = null
+    private var generation = 0
+    private var closed = false
+
+    private val heartbeat = object : Runnable {
+        override fun run() {
+            ws?.send("{\"type\":\"HEARTBEAT\"}")
+            if (!closed) main.postDelayed(this, 5000)
+        }
+    }
+
+    fun connect() {
+        closed = false
+        val gen = ++generation
+        val chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+        val token = (1..12).map { chars[(Math.random() * chars.length).toInt()] }.joinToString("")
+        val req = Request.Builder().url("wss://0.peerjs.com/peerjs?key=peerjs&id=$id&token=$token").build()
+        ws = client.newWebSocket(req, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                main.post {
+                    if (gen != generation) return@post
+                    main.removeCallbacks(heartbeat)
+                    main.post(heartbeat)
+                }
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                try {
+                    val j = JSONObject(text)
+                    val type = j.optString("type")
+                    val src = if (j.has("src")) j.optString("src") else null
+                    val payload = j.optJSONObject("payload")
+                    main.post { if (gen == generation) listener.onMessage(type, src, payload) }
+                } catch (e: Exception) {
+                    // ข้อความที่อ่านไม่ได้ ข้ามไป
+                }
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                main.post { if (gen == generation && !closed) listener.onMessage("CLOSED", null, null) }
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                main.post { if (gen == generation && !closed) listener.onMessage("CLOSED", null, null) }
+            }
+        })
+    }
+
+    fun send(type: String, dst: String, payload: JSONObject) {
+        ws?.send(JSONObject().put("type", type).put("dst", dst).put("payload", payload).toString())
+    }
+
+    fun reconnect() {
+        generation++
+        try { ws?.cancel() } catch (e: Exception) { }
+        connect()
+    }
+
+    fun close() {
+        closed = true
+        generation++
+        main.removeCallbacks(heartbeat)
+        try { ws?.close(1000, null) } catch (e: Exception) { }
+    }
+}
+
+open class SdpAdapter(private val onCreated: ((SessionDescription) -> Unit)? = null) : SdpObserver {
+    override fun onCreateSuccess(sdp: SessionDescription) { onCreated?.invoke(sdp) }
+    override fun onSetSuccess() {}
+    override fun onCreateFailure(error: String?) {}
+    override fun onSetFailure(error: String?) {}
+}
+
+/**
+ * จับภาพหน้าจอ -> ส่งให้เพื่อนด้วย WebRTC และรับปุ่มจากเพื่อนผ่าน DataChannel
+ * เพื่อนเข้าห้องแล้วได้ผู้เล่น 2–4 (port 1–3)
+ */
+class Streamer(
+    private val context: Context,
+    private val projection: Intent,
+    private val room: String,
+    private val capW: Int,
+    private val capH: Int,
+    private val onInput: (slot: Int, btn: Int, down: Boolean) -> Unit,
+    private val onStatus: (String) -> Unit
+) {
+    private class Peer(val id: String, val slot: Int, val name: String) {
+        var pc: PeerConnection? = null
+        var channel: DataChannel? = null
+    }
+
+    private val main = Handler(Looper.getMainLooper())
+    private val eglBase = EglBase.create()
+    private val factory: PeerConnectionFactory
+    private var capturer: ScreenCapturerAndroid? = null
+    private var source: VideoSource? = null
+    private var track: VideoTrack? = null
+    private var helper: SurfaceTextureHelper? = null
+    private var sig: Signaling? = null
+    private val peers = HashMap<String, Peer>()
+    private val held = HashMap<Int, MutableSet<Int>>()
+    private var stopped = false
+    private val hostId = "dokapon-$room"
+
+    init {
+        PeerConnectionFactory.initialize(
+            PeerConnectionFactory.InitializationOptions.builder(context.applicationContext).createInitializationOptions()
+        )
+        factory = PeerConnectionFactory.builder()
+            .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
+            .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
+            .createPeerConnectionFactory()
+    }
+
+    fun start() {
+        val src = factory.createVideoSource(false)
+        val h = SurfaceTextureHelper.create("capture", eglBase.eglBaseContext)
+        val cap = ScreenCapturerAndroid(projection, object : MediaProjection.Callback() {
+            override fun onStop() {
+                main.post { onStatus("หยุดจับภาพหน้าจอแล้ว") }
+            }
+        })
+        cap.initialize(h, context, src.capturerObserver)
+        cap.startCapture(capW, capH, 30)
+        // ครอปกึ่งกลางเป็นสัดส่วน 4:3 ตัดปุ่มบนจอด้านข้างออก
+        src.adaptOutputFormat(640, 480, 30)
+        source = src
+        helper = h
+        capturer = cap
+        track = factory.createVideoTrack("game", src)
+
+        sig = Signaling(hostId, object : Signaling.Listener {
+            override fun onMessage(type: String, src: String?, payload: JSONObject?) {
+                onSignal(type, src, payload)
+            }
+        })
+        sig?.connect()
+        status("กำลังเชื่อมต่อห้อง…")
+    }
+
+    private fun status(extra: String? = null) {
+        onStatus(extra ?: "ห้อง $room · เพื่อน ${peers.size} คน")
+    }
+
+    private fun onSignal(type: String, src: String?, p: JSONObject?) {
+        if (stopped) return
+        when (type) {
+            "OPEN" -> status()
+            "ID-TAKEN" -> {
+                status("รหัสห้องถูกใช้อยู่ (เซสชันเก่าค้าง) กำลังลองใหม่…")
+                main.postDelayed({ if (!stopped) sig?.reconnect() }, 5000)
+            }
+            "CLOSED" -> {
+                status("หลุดจากเซิร์ฟเวอร์จับคู่ กำลังต่อใหม่…")
+                main.postDelayed({ if (!stopped) sig?.reconnect() }, 3000)
+            }
+            "OFFER" -> {
+                if (src != null && p != null && p.optString("t") == "join") join(src, p.optString("name"))
+            }
+            "ANSWER" -> {
+                if (src != null && p != null && p.optString("t") == "sdp") {
+                    peers[src]?.pc?.setRemoteDescription(
+                        SdpAdapter(),
+                        SessionDescription(SessionDescription.Type.ANSWER, p.optString("sdp"))
+                    )
+                }
+            }
+            "CANDIDATE" -> {
+                if (src != null && p != null && p.optString("t") == "ice") {
+                    val c = IceCandidate(p.optString("sdpMid"), p.optInt("sdpMLineIndex"), p.optString("candidate"))
+                    peers[src]?.pc?.addIceCandidate(c)
+                }
+            }
+            "LEAVE" -> {
+                if (src != null) drop(src)
+            }
+        }
+    }
+
+    private fun join(src: String, name: String) {
+        if (peers.containsKey(src)) drop(src)
+        val used = peers.values.map { it.slot }.toSet()
+        val slot = listOf(1, 2, 3).firstOrNull { it !in used }
+        if (slot == null) {
+            sig?.send("ANSWER", src, JSONObject().put("t", "full"))
+            return
+        }
+        val peer = Peer(src, slot, name.ifBlank { "Player${slot + 1}" }.take(20))
+        peers[src] = peer
+        sig?.send("ANSWER", src, JSONObject().put("t", "joined").put("slot", slot).put("name", peer.name))
+        connect(peer)
+        status()
+    }
+
+    private fun connect(peer: Peer) {
+        val servers = listOf(
+            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+            PeerConnection.IceServer.builder("turn:eu-0.turn.peerjs.com:3478")
+                .setUsername("peerjs").setPassword("peerjsp").createIceServer()
+        )
+        val config = PeerConnection.RTCConfiguration(servers)
+        config.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+
+        val pc = factory.createPeerConnection(config, object : PeerConnection.Observer {
+            override fun onSignalingChange(s: PeerConnection.SignalingState?) {}
+            override fun onIceConnectionChange(s: PeerConnection.IceConnectionState?) {
+                main.post {
+                    if (peers[peer.id] !== peer) return@post
+                    when (s) {
+                        PeerConnection.IceConnectionState.FAILED,
+                        PeerConnection.IceConnectionState.CLOSED -> drop(peer.id)
+                        PeerConnection.IceConnectionState.DISCONNECTED -> main.postDelayed({
+                            if (peers[peer.id] === peer &&
+                                peer.pc?.iceConnectionState() == PeerConnection.IceConnectionState.DISCONNECTED
+                            ) drop(peer.id)
+                        }, 10000)
+                        else -> {}
+                    }
+                }
+            }
+            override fun onIceConnectionReceivingChange(b: Boolean) {}
+            override fun onIceGatheringChange(s: PeerConnection.IceGatheringState?) {}
+            override fun onIceCandidate(c: IceCandidate?) {
+                if (c == null) return
+                sig?.send(
+                    "CANDIDATE", peer.id,
+                    JSONObject().put("t", "ice").put("candidate", c.sdp)
+                        .put("sdpMid", c.sdpMid).put("sdpMLineIndex", c.sdpMLineIndex)
+                )
+            }
+            override fun onIceCandidatesRemoved(c: Array<out IceCandidate>?) {}
+            override fun onAddStream(s: MediaStream?) {}
+            override fun onRemoveStream(s: MediaStream?) {}
+            override fun onDataChannel(d: DataChannel?) {}
+            override fun onRenegotiationNeeded() {}
+            override fun onAddTrack(r: RtpReceiver?, s: Array<out MediaStream>?) {}
+        }) ?: return
+        peer.pc = pc
+
+        val t = track
+        if (t != null) {
+            val sender = pc.addTrack(t, listOf("game"))
+            try {
+                val params = sender.parameters
+                for (e in params.encodings) {
+                    e.maxBitrateBps = 2_000_000
+                    e.maxFramerate = 30
+                }
+                sender.setParameters(params)
+            } catch (e: Exception) {
+                // ตั้งบิตเรตไม่ได้ ใช้ค่าเริ่มต้น
+            }
+        }
+
+        val channel = pc.createDataChannel("input", DataChannel.Init())
+        peer.channel = channel
+        channel.registerObserver(object : DataChannel.Observer {
+            override fun onBufferedAmountChange(l: Long) {}
+            override fun onStateChange() {}
+            override fun onMessage(buffer: DataChannel.Buffer) {
+                try {
+                    val bytes = ByteArray(buffer.data.remaining())
+                    buffer.data.get(bytes)
+                    val j = JSONObject(String(bytes))
+                    val btn = j.getInt("b")
+                    val down = j.getInt("d") == 1
+                    main.post { dispatchInput(peer.slot, btn, down) }
+                } catch (e: Exception) {
+                    // ข้อความที่อ่านไม่ได้ ข้ามไป
+                }
+            }
+        })
+
+        pc.createOffer(SdpAdapter { offer ->
+            pc.setLocalDescription(SdpAdapter(), offer)
+            sig?.send(
+                "OFFER", peer.id,
+                JSONObject().put("t", "sdp").put("type", "offer").put("sdp", offer.description)
+            )
+        }, MediaConstraints())
+    }
+
+    private fun dispatchInput(slot: Int, btn: Int, down: Boolean) {
+        val set = held.getOrPut(slot) { mutableSetOf() }
+        if (down) set.add(btn) else set.remove(btn)
+        onInput(slot, btn, down)
+    }
+
+    private fun drop(id: String) {
+        val p = peers.remove(id) ?: return
+        held[p.slot]?.toList()?.forEach { dispatchInput(p.slot, it, false) }
+        try { p.channel?.close() } catch (e: Exception) { }
+        try { p.pc?.close() } catch (e: Exception) { }
+        status()
+    }
+
+    fun stop() {
+        if (stopped) return
+        stopped = true
+        peers.keys.toList().forEach { drop(it) }
+        sig?.close()
+        try { capturer?.stopCapture() } catch (e: Exception) { }
+        try { capturer?.dispose() } catch (e: Exception) { }
+        try { track?.dispose() } catch (e: Exception) { }
+        try { source?.dispose() } catch (e: Exception) { }
+        try { helper?.dispose() } catch (e: Exception) { }
+        try { factory.dispose() } catch (e: Exception) { }
+        try { eglBase.release() } catch (e: Exception) { }
+    }
+}
 
 class GameActivity : AppCompatActivity() {
 
     private var retroView: GLRetroView? = null
+    private var streamer: Streamer? = null
+    private lateinit var statusView: TextView
+    private lateinit var streamBtn: TextView
 
-    // ถ้าในเกมปุ่ม ✕ กับ ○ ทำงานสลับกัน ให้เปลี่ยนเป็น true แล้ว build ใหม่
-    private val swapAB = false
+    private val projectionLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+            val data = r.data
+            if (r.resultCode == Activity.RESULT_OK && data != null) {
+                startStreaming(data)
+            } else {
+                Toast.makeText(this, "ไม่ได้อนุญาตให้จับภาพหน้าจอ", Toast.LENGTH_LONG).show()
+            }
+        }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -65,13 +485,80 @@ class GameActivity : AppCompatActivity() {
         }
 
         buildControls(root)
+        buildStreamBar(root)
         setContentView(root)
+    }
+
+    override fun onDestroy() {
+        streamer?.stop()
+        streamer = null
+        stopService(Intent(this, StreamService::class.java))
+        super.onDestroy()
     }
 
     private fun press(code: Int, down: Boolean) {
         retroView?.sendKeyEvent(if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP, code, 0)
     }
 
+    // ---------- สตรีม ----------
+    private fun buildStreamBar(root: FrameLayout) {
+        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        statusView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            background = GradientDrawable().apply { cornerRadius = dp(12).toFloat(); setColor(Color.argb(140, 0, 0, 0)) }
+            text = "ยังไม่ได้สตรีม"
+        }
+        streamBtn = TextView(this).apply {
+            text = "📡 เริ่มสตรีม"
+            textSize = 13f
+            setTextColor(Color.BLACK)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.rgb(242, 193, 78)) }
+            setOnClickListener {
+                val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                projectionLauncher.launch(mpm.createScreenCaptureIntent())
+            }
+        }
+        bar.addView(statusView)
+        bar.addView(streamBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(8) })
+        root.addView(bar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            topMargin = dp(6)
+        })
+    }
+
+    private fun startStreaming(data: Intent) {
+        ContextCompat.startForegroundService(this, Intent(this, StreamService::class.java))
+        streamBtn.visibility = View.GONE
+        statusView.text = "กำลังเริ่มสตรีม…"
+        val room = getSharedPreferences("dokapon", MODE_PRIVATE).getString("room", "DOKAPN") ?: "DOKAPN"
+        val dm = resources.displayMetrics
+        // รอให้ service ขึ้นเป็น foreground ก่อน แล้วค่อยเริ่มจับภาพ (ข้อกำหนดของ Android 14)
+        Handler(Looper.getMainLooper()).postDelayed({
+            try {
+                val s = Streamer(
+                    this, data, room, dm.widthPixels / 2, dm.heightPixels / 2,
+                    { slot, btn, down ->
+                        val code = PadMap.code(btn)
+                        if (code != null) {
+                            retroView?.sendKeyEvent(if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP, code, slot)
+                        }
+                    },
+                    { text -> runOnUiThread { statusView.text = text } }
+                )
+                streamer = s
+                s.start()
+            } catch (e: Throwable) {
+                Toast.makeText(this, "เริ่มสตรีมไม่สำเร็จ: ${e.message ?: e}", Toast.LENGTH_LONG).show()
+                statusView.text = "สตรีมไม่สำเร็จ"
+                streamBtn.visibility = View.VISIBLE
+            }
+        }, 700)
+    }
+
+    // ---------- ปุ่มบนจอของเรา (ผู้เล่น 1) ----------
     @SuppressLint("ClickableViewAccessibility")
     private fun pad(label: String, code: Int, circle: Boolean = false): TextView {
         return TextView(this).apply {
@@ -117,7 +604,6 @@ class GameActivity : AppCompatActivity() {
         val size = cell * 3 + gap * 2
         val margin = dp(16)
 
-        // ปุ่มทิศทาง (ล่างซ้าย)
         val dpad = FrameLayout(this)
         place(dpad, pad("▲", KeyEvent.KEYCODE_DPAD_UP), step, 0, cell, cell)
         place(dpad, pad("◀", KeyEvent.KEYCODE_DPAD_LEFT), 0, step, cell, cell)
@@ -129,21 +615,17 @@ class GameActivity : AppCompatActivity() {
             bottomMargin = margin
         })
 
-        // ปุ่มกด △ □ ○ ✕ (ล่างขวา) รหัสปุ่มตามรูปแบบจอยทั่วไป: ✕=A ○=B □=X △=Y
-        val cross = if (swapAB) KeyEvent.KEYCODE_BUTTON_B else KeyEvent.KEYCODE_BUTTON_A
-        val circle = if (swapAB) KeyEvent.KEYCODE_BUTTON_A else KeyEvent.KEYCODE_BUTTON_B
         val face = FrameLayout(this)
-        place(face, pad("△", KeyEvent.KEYCODE_BUTTON_Y, true), step, 0, cell, cell)
-        place(face, pad("□", KeyEvent.KEYCODE_BUTTON_X, true), 0, step, cell, cell)
-        place(face, pad("○", circle, true), step * 2, step, cell, cell)
-        place(face, pad("✕", cross, true), step, step * 2, cell, cell)
+        place(face, pad("△", PadMap.triangle(), true), step, 0, cell, cell)
+        place(face, pad("□", PadMap.square(), true), 0, step, cell, cell)
+        place(face, pad("○", PadMap.circle(), true), step * 2, step, cell, cell)
+        place(face, pad("✕", PadMap.cross(), true), step, step * 2, cell, cell)
         root.addView(face, FrameLayout.LayoutParams(size, size).apply {
             gravity = Gravity.BOTTOM or Gravity.END
             rightMargin = margin
             bottomMargin = margin
         })
 
-        // ปุ่มไหล่
         val sw = dp(84)
         val sh = dp(40)
         val top = dp(10)
@@ -159,7 +641,6 @@ class GameActivity : AppCompatActivity() {
         shoulder("R2", KeyEvent.KEYCODE_BUTTON_R2, false, 0)
         shoulder("R1", KeyEvent.KEYCODE_BUTTON_R1, false, 1)
 
-        // Start / Select (กลางล่าง)
         val mid = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         mid.addView(pad("Select", KeyEvent.KEYCODE_BUTTON_SELECT), LinearLayout.LayoutParams(dp(78), dp(34)).apply { rightMargin = dp(10) })
         mid.addView(pad("Start", KeyEvent.KEYCODE_BUTTON_START), LinearLayout.LayoutParams(dp(78), dp(34)))
