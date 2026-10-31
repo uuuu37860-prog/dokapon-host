@@ -11,6 +11,7 @@
 
     <application
         android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
         android:label="Dokapon Host"
         android:theme="@style/Theme.AppCompat.NoActionBar">
 
@@ -34,6 +35,16 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
             android:screenOrientation="sensorLandscape" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.bom.dokapon.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <service
             android:name=".StreamService"

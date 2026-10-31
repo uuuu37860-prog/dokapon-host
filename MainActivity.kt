@@ -1,37 +1,70 @@
 package com.bom.dokapon
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
-import android.widget.Button
 import android.text.InputFilter
+import android.view.Gravity
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.WebChromeClient
 import android.webkit.WebView
-import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.FileProvider
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import java.io.File
 import java.security.SecureRandom
 
 class MainActivity : AppCompatActivity() {
 
+    private val cBg = Color.parseColor("#14122B")
+    private val cCard = Color.parseColor("#201D42")
+    private val cKey = Color.parseColor("#2C2859")
+    private val cGold = Color.parseColor("#F2C14E")
+    private val cInk = Color.parseColor("#F3EFE6")
+    private val cDim = Color.parseColor("#9A96C0")
+    private val cDark = Color.parseColor("#1B1630")
+
     private lateinit var info: TextView
-    private lateinit var startBtn: Button
+    private lateinit var biosInfo: TextView
+    private lateinit var startBtn: TextView
     private lateinit var roomText: TextView
     private lateinit var urlEdit: EditText
+    private lateinit var hostSection: LinearLayout
+    private lateinit var playerSection: LinearLayout
+    private lateinit var tabHost: TextView
+    private lateinit var tabPlayer: TextView
 
+    private val pickGame =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            if (uris.isNotEmpty()) importFiles(uris, File(filesDir, "game"), clearFirst = true)
+        }
+    private val pickBios =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            if (uris.isNotEmpty()) importFiles(uris, File(filesDir, "system"), clearFirst = false)
+        }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun prefs() = getSharedPreferences("dokapon", MODE_PRIVATE)
 
+    // ---------- ห้อง ----------
     private fun newRoom(): String {
         val a = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
         val r = SecureRandom()
@@ -48,125 +81,267 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun pageUrl(): String {
-        val saved = prefs().getString("page", null)
-        return saved ?: "https://bom979229-boop.github.io/Dokapon/play.html"
+        return prefs().getString("page", null) ?: "https://bom979229-boop.github.io/Dokapon/play.html"
     }
 
-    private fun shareLink() {
-        val url = urlEdit.text.toString().trim()
-        prefs().edit().putString("page", url).apply()
-        val sep = if (url.contains("?")) "&" else "?"
-        val link = "$url${sep}room=${room()}"
-        val send = Intent(Intent.ACTION_SEND).setType("text/plain")
-            .putExtra(Intent.EXTRA_TEXT, "เข้าห้อง Dokapon ด้วยกัน: $link")
-        startActivity(Intent.createChooser(send, "แชร์ลิงก์ห้อง"))
+    // ---------- ชิ้นส่วน UI ----------
+    private fun rounded(color: Int, r: Int, stroke: Int? = null): GradientDrawable {
+        return GradientDrawable().apply {
+            cornerRadius = dp(r).toFloat()
+            setColor(color)
+            if (stroke != null) setStroke(dp(1), stroke)
+        }
     }
 
-    private val pickGame =
-        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-            if (uris.isNotEmpty()) importFiles(uris, File(filesDir, "game"), clearFirst = true)
-        }
-    private val pickBios =
-        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-            if (uris.isNotEmpty()) importFiles(uris, File(filesDir, "system"), clearFirst = false)
-        }
+    private fun lp(topMargin: Int = 0): LinearLayout.LayoutParams {
+        return LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { this.topMargin = dp(topMargin) }
+    }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun card(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rounded(cCard, 18)
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            layoutParams = lp(12)
+        }
+    }
+
+    private fun heading(text: String): TextView {
+        return TextView(this).apply {
+            this.text = text
+            textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(cInk)
+        }
+    }
+
+    private fun note(text: String): TextView {
+        return TextView(this).apply {
+            this.text = text
+            textSize = 13f
+            setTextColor(cDim)
+            setPadding(0, dp(6), 0, 0)
+        }
+    }
+
+    private fun button(label: String, primary: Boolean, onClick: () -> Unit): TextView {
+        return TextView(this).apply {
+            text = label
+            gravity = Gravity.CENTER
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(if (primary) cDark else cInk)
+            background = rounded(if (primary) cGold else cKey, 14)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            layoutParams = lp(10)
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun field(hintText: String): EditText {
+        return EditText(this).apply {
+            hint = hintText
+            setHintTextColor(cDim)
+            setTextColor(cInk)
+            textSize = 16f
+            setSingleLine(true)
+            background = rounded(cKey, 12, Color.parseColor("#3B3672"))
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            layoutParams = lp(10)
+        }
+    }
+
+    private fun selectTab(host: Boolean) {
+        hostSection.visibility = if (host) android.view.View.VISIBLE else android.view.View.GONE
+        playerSection.visibility = if (host) android.view.View.GONE else android.view.View.VISIBLE
+        tabHost.background = rounded(if (host) cGold else cKey, 14)
+        tabHost.setTextColor(if (host) cDark else cInk)
+        tabPlayer.background = rounded(if (host) cKey else cGold, 14)
+        tabPlayer.setTextColor(if (host) cInk else cDark)
+        prefs().edit().putBoolean("tab_host", host).apply()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.statusBarColor = cBg
+        window.navigationBarColor = cBg
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(28), dp(20), dp(20))
+            setBackgroundColor(cBg)
+            setPadding(dp(16), dp(16), dp(16), dp(28))
         }
-        root.addView(TextView(this).apply { text = "Dokapon Host"; textSize = 26f; setTextColor(Color.BLACK) })
-        root.addView(TextView(this).apply {
-            text = "รันเกมบนเครื่องนี้แบบเนทีฟ (ขั้นที่ 1: ทดสอบความเร็ว)"
+
+        // ---------- ปก ----------
+        val cover = FrameLayout(this).apply {
+            background = rounded(cCard, 20)
+            clipToOutline = true
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(170))
+        }
+        cover.addView(
+            ImageView(this).apply {
+                setImageResource(R.drawable.cover)
+                scaleType = ImageView.ScaleType.CENTER_CROP
+            },
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        )
+        val coverText = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(14), dp(18), dp(14))
+        }
+        coverText.addView(TextView(this).apply {
+            text = "Dokapon Online"
+            textSize = 26f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        })
+        coverText.addView(TextView(this).apply {
+            text = "เล่นเกมกระดานกับเพื่อนผ่านมือถือ"
+            textSize = 13f
+            setTextColor(Color.parseColor("#E8E3FF"))
+        })
+        cover.addView(
+            coverText,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { gravity = Gravity.BOTTOM or Gravity.START }
+        )
+        root.addView(cover)
+
+        // ---------- แท็บ ----------
+        val tabs = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = lp(14)
+        }
+        tabHost = TextView(this).apply {
+            text = "🎮 โฮสต์ (มีไฟล์เกม)"
+            gravity = Gravity.CENTER
             textSize = 14f
-            setPadding(0, dp(4), 0, dp(16))
-        })
-
-        root.addView(Button(this).apply {
-            text = "1. เลือกไฟล์เกม (เลือก .cue และ .bin พร้อมกัน หรือเลือก .bin อย่างเดียว)"
-            setOnClickListener { pickGame.launch(arrayOf("*/*")) }
-        })
-        root.addView(Button(this).apply {
-            text = "2. เลือก BIOS PS1 (ไม่บังคับ)"
-            setOnClickListener { pickBios.launch(arrayOf("*/*")) }
-        })
-        startBtn = Button(this).apply {
-            text = "3. เริ่มเกม"
-            setOnClickListener { startGame() }
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(8), dp(12), dp(8), dp(12))
+            setOnClickListener { selectTab(true) }
         }
-        root.addView(startBtn)
+        tabPlayer = TextView(this).apply {
+            text = "🕹 ผู้เล่น (เข้าห้องเพื่อน)"
+            gravity = Gravity.CENTER
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(8), dp(12), dp(8), dp(12))
+            setOnClickListener { selectTab(false) }
+        }
+        tabs.addView(tabHost, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) })
+        tabs.addView(tabPlayer, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(6) })
+        root.addView(tabs)
 
-        root.addView(TextView(this).apply {
-            text = "ห้องสำหรับเพื่อน"
-            textSize = 16f
-            setTextColor(Color.BLACK)
-            setPadding(0, dp(20), 0, 0)
-        })
-        roomText = TextView(this).apply { textSize = 24f; text = "รหัสห้อง: " + room() }
-        root.addView(roomText)
-        root.addView(Button(this).apply {
-            text = "สุ่มรหัสห้องใหม่"
-            setOnClickListener {
-                prefs().edit().putString("room", newRoom()).apply()
-                roomText.text = "รหัสห้อง: " + room()
-            }
-        })
-        root.addView(TextView(this).apply { text = "ลิงก์หน้าเว็บของเพื่อน (หน้า play.html)"; textSize = 13f })
-        urlEdit = EditText(this).apply { setText(pageUrl()); textSize = 13f; setSingleLine(true) }
-        root.addView(urlEdit)
-        root.addView(Button(this).apply {
-            text = "แชร์ลิงก์ห้องให้เพื่อน"
-            setOnClickListener { shareLink() }
-        })
+        // ---------- ส่วนโฮสต์ ----------
+        hostSection = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
+        val gameCard = card()
+        gameCard.addView(heading("1. เกมของคุณ"))
+        info = TextView(this).apply { textSize = 13f; setTextColor(cDim); setPadding(0, dp(6), 0, 0) }
+        gameCard.addView(info)
+        gameCard.addView(button("เลือกไฟล์เกม (.cue + .bin หรือ .bin)", false) { pickGame.launch(arrayOf("*/*")) })
+        biosInfo = TextView(this).apply { textSize = 13f; setTextColor(cDim); setPadding(0, dp(12), 0, 0) }
+        gameCard.addView(biosInfo)
+        gameCard.addView(button("เลือก BIOS PS1 (ไม่บังคับ)", false) { pickBios.launch(arrayOf("*/*")) })
+        startBtn = button("▶  เริ่มเกม", true) { startGame() }
+        gameCard.addView(startBtn)
+        hostSection.addView(gameCard)
 
-        root.addView(TextView(this).apply {
-            text = "เข้าห้องของเพื่อน (เล่นเป็นผู้เล่น ไม่ต้องมีไฟล์เกม)"
-            textSize = 16f
-            setTextColor(Color.BLACK)
-            setPadding(0, dp(24), 0, 0)
+        val roomCard = card()
+        roomCard.addView(heading("2. ห้องสำหรับเพื่อน"))
+        roomText = TextView(this).apply {
+            textSize = 34f
+            typeface = Typeface.MONOSPACE
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(cGold)
+            letterSpacing = 0.18f
+            setPadding(0, dp(8), 0, 0)
+            text = room()
+            setOnClickListener { copyRoom() }
+        }
+        roomCard.addView(roomText)
+        roomCard.addView(note("แตะรหัสเพื่อคัดลอก เพื่อนที่ติดตั้งแอปนี้ใส่รหัสนี้ในแท็บ \"ผู้เล่น\""))
+        roomCard.addView(button("📨  แชร์รหัสห้อง", true) { shareRoom() })
+        roomCard.addView(button("📦  ส่งแอปให้เพื่อน (ไฟล์ APK)", false) { shareApk() })
+        roomCard.addView(button("🔄  สุ่มรหัสห้องใหม่", false) {
+            prefs().edit().putString("room", newRoom()).apply()
+            roomText.text = room()
         })
-        val joinCode = EditText(this).apply {
-            hint = "รหัสห้อง 6 ตัว"
-            setSingleLine(true)
+        roomCard.addView(note("ลิงก์หน้าเว็บสำหรับเพื่อนที่ไม่ลงแอป (เช่น iPhone)"))
+        urlEdit = field("https://.../play.html").apply { setText(pageUrl()); textSize = 13f }
+        roomCard.addView(urlEdit)
+        hostSection.addView(roomCard)
+        root.addView(hostSection)
+
+        // ---------- ส่วนผู้เล่น ----------
+        playerSection = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val joinCard = card()
+        joinCard.addView(heading("เข้าห้องของเพื่อน"))
+        joinCard.addView(note("ไม่ต้องมีไฟล์เกม แค่ใส่รหัสห้องที่เพื่อนให้มา"))
+        val joinCode = field("รหัสห้อง 6 ตัว").apply {
             filters = arrayOf(InputFilter.AllCaps(), InputFilter.LengthFilter(6))
+            setText(prefs().getString("pcode", "") ?: "")
         }
-        val joinName = EditText(this).apply {
-            hint = "ชื่อของคุณ"
-            setSingleLine(true)
-            setText(prefs().getString("pname", "") ?: "")
-        }
-        root.addView(joinCode)
-        root.addView(joinName)
-        root.addView(Button(this).apply {
-            text = "เข้าห้องเป็นผู้เล่น"
-            setOnClickListener {
-                val code = joinCode.text.toString().trim().uppercase()
-                val nm = joinName.text.toString().trim()
-                if (code.length < 4) {
-                    Toast.makeText(this@MainActivity, "ใส่รหัสห้องก่อน", Toast.LENGTH_SHORT).show()
-                } else {
-                    prefs().edit().putString("pname", nm).apply()
-                    startActivity(
-                        Intent(this@MainActivity, PlayerActivity::class.java)
-                            .putExtra("room", code).putExtra("name", nm)
-                    )
-                }
+        val joinName = field("ชื่อของคุณ").apply { setText(prefs().getString("pname", "") ?: "") }
+        joinCard.addView(joinCode)
+        joinCard.addView(joinName)
+        joinCard.addView(button("เข้าห้องเป็นผู้เล่น", true) {
+            val code = joinCode.text.toString().trim().uppercase()
+            val nm = joinName.text.toString().trim()
+            if (code.length < 4) {
+                Toast.makeText(this, "ใส่รหัสห้องก่อน", Toast.LENGTH_SHORT).show()
+            } else {
+                prefs().edit().putString("pname", nm).putString("pcode", code).apply()
+                startActivity(Intent(this, PlayerActivity::class.java).putExtra("room", code).putExtra("name", nm))
             }
         })
+        playerSection.addView(joinCard)
+        root.addView(playerSection)
 
-        info = TextView(this).apply { textSize = 14f; setPadding(0, dp(16), 0, 0) }
-        root.addView(info)
-
-        setContentView(ScrollView(this).apply { addView(root) })
+        setContentView(ScrollView(this).apply {
+            setBackgroundColor(cBg)
+            isFillViewport = true
+            addView(root)
+        })
+        selectTab(prefs().getBoolean("tab_host", true))
         refresh()
     }
 
+    // ---------- แชร์ ----------
+    private fun copyRoom() {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("room", room()))
+        Toast.makeText(this, "คัดลอกรหัสห้องแล้ว", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun shareRoom() {
+        val url = urlEdit.text.toString().trim()
+        prefs().edit().putString("page", url).apply()
+        val sep = if (url.contains("?")) "&" else "?"
+        val web = if (url.isNotEmpty()) "\nไม่ลงแอป (เช่น iPhone) เปิดลิงก์นี้: $url${sep}room=${room()}" else ""
+        val text = "เล่น Dokapon ด้วยกัน!\nรหัสห้อง: ${room()}\nติดตั้งแอป Dokapon Host แล้วไปแท็บ \"ผู้เล่น\" ใส่รหัสนี้$web"
+        val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
+        startActivity(Intent.createChooser(send, "แชร์รหัสห้อง"))
+    }
+
+    private fun shareApk() {
+        try {
+            val dir = File(cacheDir, "share").apply { mkdirs() }
+            val out = File(dir, "Dokapon-Host.apk")
+            File(applicationInfo.sourceDir).copyTo(out, overwrite = true)
+            val uri = FileProvider.getUriForFile(this, "com.bom.dokapon.fileprovider", out)
+            val send = Intent(Intent.ACTION_SEND)
+                .setType("application/vnd.android.package-archive")
+                .putExtra(Intent.EXTRA_STREAM, uri)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(Intent.createChooser(send, "ส่งแอปให้เพื่อน"))
+        } catch (e: Exception) {
+            Toast.makeText(this, "ส่งแอปไม่สำเร็จ: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    // ---------- ไฟล์เกม ----------
     private fun displayName(uri: Uri): String {
         var name: String? = null
         contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
@@ -221,14 +396,14 @@ class MainActivity : AppCompatActivity() {
         val game = findGame()
         val gameFiles = File(filesDir, "game").listFiles()?.filter { it.isFile }.orEmpty()
         val bios = File(filesDir, "system").listFiles()?.filter { it.isFile }.orEmpty()
-        val sb = StringBuilder()
-        sb.append("ไฟล์เกม: ")
-        if (gameFiles.isEmpty()) sb.append("ยังไม่ได้เลือก\n")
-        else sb.append(gameFiles.joinToString { "${it.name} (${it.length() / 1048576} MB)" }).append('\n')
-        sb.append("จะเปิด: ").append(game?.name ?: "-").append('\n')
-        sb.append("BIOS: ").append(if (bios.isEmpty()) "ไม่มี (ใช้ตัวจำลอง HLE)" else bios.joinToString { it.name })
-        info.text = sb.toString()
+        info.text = if (gameFiles.isEmpty()) {
+            "ยังไม่ได้เลือกไฟล์เกม"
+        } else {
+            "เกม: " + gameFiles.joinToString { "${it.name} (${it.length() / 1048576} MB)" }
+        }
+        biosInfo.text = "BIOS: " + if (bios.isEmpty()) "ไม่มี (ใช้ตัวจำลอง HLE)" else bios.joinToString { it.name }
         startBtn.isEnabled = game != null
+        startBtn.alpha = if (game != null) 1f else 0.45f
     }
 
     private fun startGame() {
@@ -236,7 +411,6 @@ class MainActivity : AppCompatActivity() {
         startActivity(Intent(this, GameActivity::class.java).putExtra("game", game.absolutePath))
     }
 }
-
 
 /** โหมดผู้เล่น: เปิดหน้าเล่นที่ฝังไว้ในแอปผ่าน WebView (ไม่ต้องพึ่งเว็บภายนอก) */
 class PlayerActivity : AppCompatActivity() {

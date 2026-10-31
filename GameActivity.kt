@@ -28,7 +28,9 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -36,6 +38,9 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.swordfish.libretrodroid.GLRetroView
 import com.swordfish.libretrodroid.GLRetroViewData
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -245,7 +250,7 @@ class Streamer(
         cap.initialize(h, context, src.capturerObserver)
         cap.startCapture(capW, capH, 30)
         // ครอปกึ่งกลางเป็นสัดส่วน 4:3 ตัดปุ่มบนจอด้านข้างออก
-        src.adaptOutputFormat(640, 480, 30)
+        src.adaptOutputFormat(320, 240, 30)
         source = src
         helper = h
         capturer = cap
@@ -438,6 +443,16 @@ class GameActivity : AppCompatActivity() {
     private lateinit var statusView: TextView
     private lateinit var streamBtn: TextView
 
+    private var gameKey = "game"
+    private val ui = Handler(Looper.getMainLooper())
+    private val scope = CoroutineScope(Dispatchers.Main)
+    private val autosave = object : Runnable {
+        override fun run() {
+            saveSram(false)
+            ui.postDelayed(this, 20000)
+        }
+    }
+
     private val projectionLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
             val data = r.data
@@ -465,12 +480,15 @@ class GameActivity : AppCompatActivity() {
             return
         }
 
+        gameKey = File(gamePath).nameWithoutExtension
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
 
         try {
             val data = GLRetroViewData(this).apply {
                 coreFilePath = "libpcsx_rearmed_libretro_android.so"
                 gameFilePath = gamePath
+                val sram = sramFile()
+                if (sram.exists()) saveRAMState = sram.readBytes()
                 systemDirectory = File(filesDir, "system").apply { mkdirs() }.absolutePath
                 savesDirectory = File(filesDir, "saves").apply { mkdirs() }.absolutePath
             }
@@ -487,9 +505,121 @@ class GameActivity : AppCompatActivity() {
         buildControls(root)
         buildStreamBar(root)
         setContentView(root)
+
+        ui.postDelayed(autosave, 20000)
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                exitGame()
+            }
+        })
+    }
+
+    override fun onPause() {
+        saveSram(false)
+        super.onPause()
+    }
+
+    // ---------- เซฟเกม / เมนู ----------
+    private fun savesDir(): File = File(filesDir, "saves").apply { mkdirs() }
+    private fun sramFile(): File = File(savesDir(), "$gameKey.srm")
+    private fun stateFile(n: Int): File = File(savesDir(), "$gameKey.state$n")
+
+    private fun toast(t: String) {
+        Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
+    }
+
+    /** บันทึกเมมการ์ดของเกม (ที่เกมเซฟลงไป) ลงไฟล์ในแอป */
+    private fun saveSram(showToast: Boolean) {
+        val v = retroView ?: return
+        scope.launch {
+            try {
+                val bytes = v.serializeSRAM()
+                if (bytes.isNotEmpty()) {
+                    sramFile().writeBytes(bytes)
+                    if (showToast) toast("บันทึกเมมการ์ดแล้ว")
+                } else if (showToast) {
+                    toast("ยังไม่มีข้อมูลเมมการ์ดให้บันทึก")
+                }
+            } catch (e: Throwable) {
+                if (showToast) toast("บันทึกเมมการ์ดไม่สำเร็จ: ${e.message}")
+            }
+        }
+    }
+
+    private fun saveState(n: Int) {
+        val v = retroView ?: return
+        scope.launch {
+            try {
+                val bytes = v.serializeState()
+                stateFile(n).writeBytes(bytes)
+                toast("บันทึกสถานะช่อง $n แล้ว")
+            } catch (e: Throwable) {
+                toast("บันทึกสถานะไม่สำเร็จ: ${e.message}")
+            }
+        }
+    }
+
+    private fun loadState(n: Int) {
+        val v = retroView ?: return
+        val f = stateFile(n)
+        if (!f.exists()) {
+            toast("ช่อง $n ยังว่างอยู่")
+            return
+        }
+        scope.launch {
+            try {
+                v.unserializeState(f.readBytes())
+                toast("โหลดสถานะช่อง $n แล้ว")
+            } catch (e: Throwable) {
+                toast("โหลดสถานะไม่สำเร็จ: ${e.message}")
+            }
+        }
+    }
+
+    private fun exitGame() {
+        val v = retroView
+        if (v == null) {
+            finish()
+            return
+        }
+        scope.launch {
+            try {
+                val bytes = v.serializeSRAM()
+                if (bytes.isNotEmpty()) sramFile().writeBytes(bytes)
+            } catch (e: Throwable) {
+                // เซฟไม่ได้ก็ออกต่อ
+            }
+            finish()
+        }
+    }
+
+    private fun showMenu() {
+        val v = retroView ?: return
+        val items = arrayOf(
+            "💾 บันทึกสถานะ ช่อง 1", "💾 บันทึกสถานะ ช่อง 2", "💾 บันทึกสถานะ ช่อง 3",
+            "📂 โหลดสถานะ ช่อง 1", "📂 โหลดสถานะ ช่อง 2", "📂 โหลดสถานะ ช่อง 3",
+            "💳 บันทึกเมมการ์ดตอนนี้",
+            if (v.audioEnabled) "🔇 ปิดเสียงเกม" else "🔊 เปิดเสียงเกม",
+            "🔄 รีเซ็ตเกม",
+            "❌ ออกจากเกม"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("เมนู")
+            .setItems(items) { _, i ->
+                when (i) {
+                    0, 1, 2 -> { saveState(i + 1) }
+                    3, 4, 5 -> { loadState(i - 2) }
+                    6 -> { saveSram(true) }
+                    7 -> { v.audioEnabled = !v.audioEnabled }
+                    8 -> { v.reset() }
+                    9 -> { exitGame() }
+                }
+            }
+            .show()
     }
 
     override fun onDestroy() {
+        ui.removeCallbacks(autosave)
         streamer?.stop()
         streamer = null
         stopService(Intent(this, StreamService::class.java))
@@ -521,6 +651,15 @@ class GameActivity : AppCompatActivity() {
                 projectionLauncher.launch(mpm.createScreenCaptureIntent())
             }
         }
+        val gear = TextView(this).apply {
+            text = "⚙"
+            textSize = 18f
+            setTextColor(Color.WHITE)
+            setPadding(dp(12), dp(2), dp(12), dp(2))
+            background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.argb(140, 0, 0, 0)) }
+            setOnClickListener { showMenu() }
+        }
+        bar.addView(gear, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(8) })
         bar.addView(statusView)
         bar.addView(streamBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(8) })
         root.addView(bar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -539,7 +678,7 @@ class GameActivity : AppCompatActivity() {
         Handler(Looper.getMainLooper()).postDelayed({
             try {
                 val s = Streamer(
-                    this, data, room, dm.widthPixels / 2, dm.heightPixels / 2,
+                    this, data, room, dm.widthPixels / 3, dm.heightPixels / 3,
                     { slot, btn, down ->
                         val code = PadMap.code(btn)
                         if (code != null) {
