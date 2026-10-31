@@ -31,6 +31,12 @@ jobs:
           cp app.build.gradle.kts app/build.gradle.kts
           cp AndroidManifest.xml app/src/main/AndroidManifest.xml
           cp MainActivity.kt GameActivity.kt app/src/main/java/com/bom/dokapon/
+          mkdir -p app/src/main/res/mipmap-anydpi-v26 app/src/main/res/drawable app/src/main/res/values app/src/main/res/xml
+          cp ic_launcher.xml app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+          cp ic_launcher_foreground.xml app/src/main/res/drawable/ic_launcher_foreground.xml
+          cp cover.xml app/src/main/res/drawable/cover.xml
+          cp colors.xml app/src/main/res/values/colors.xml
+          cp file_paths.xml app/src/main/res/xml/file_paths.xml
 
       - name: ดาวน์โหลดอีมูเลเตอร์ PCSX ReARMed (arm64)
         run: |
