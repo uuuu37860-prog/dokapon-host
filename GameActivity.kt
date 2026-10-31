@@ -28,9 +28,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -38,9 +36,6 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.swordfish.libretrodroid.GLRetroView
 import com.swordfish.libretrodroid.GLRetroViewData
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -221,9 +216,9 @@ class Streamer(
     private val factory: PeerConnectionFactory
     private var capturer: ScreenCapturerAndroid? = null
     private var source: VideoSource? = null
-    private var track: VideoTrack? = null
+    @Volatile private var track: VideoTrack? = null
     private var helper: SurfaceTextureHelper? = null
-    private var sig: Signaling? = null
+    @Volatile private var sig: Signaling? = null
     private val peers = HashMap<String, Peer>()
     private val held = HashMap<Int, MutableSet<Int>>()
     private var stopped = false
@@ -250,7 +245,7 @@ class Streamer(
         cap.initialize(h, context, src.capturerObserver)
         cap.startCapture(capW, capH, 30)
         // ครอปกึ่งกลางเป็นสัดส่วน 4:3 ตัดปุ่มบนจอด้านข้างออก
-        src.adaptOutputFormat(320, 240, 30)
+        src.adaptOutputFormat(640, 480, 30)
         source = src
         helper = h
         capturer = cap
@@ -399,12 +394,32 @@ class Streamer(
         })
 
         pc.createOffer(SdpAdapter { offer ->
-            pc.setLocalDescription(SdpAdapter(), offer)
+            // ดัน H264 ขึ้นมาก่อน เพื่อให้ใช้ตัวเข้ารหัสฮาร์ดแวร์ (VP8 เป็นซอฟต์แวร์ กิน CPU ชนกับอีมูเลเตอร์จนกระตุก)
+            val munged = SessionDescription(offer.type, preferH264(offer.description))
+            pc.setLocalDescription(SdpAdapter(), munged)
             sig?.send(
                 "OFFER", peer.id,
-                JSONObject().put("t", "sdp").put("type", "offer").put("sdp", offer.description)
+                JSONObject().put("t", "sdp").put("type", "offer").put("sdp", munged.description)
             )
         }, MediaConstraints())
+    }
+
+    /** จัดลำดับ payload type ในบรรทัด m=video ให้ H264 มาก่อน (ถ้าไม่มี H264 ก็คืนค่าเดิม) */
+    private fun preferH264(sdp: String): String {
+        val lines = sdp.split("\r\n")
+        val mIdx = lines.indexOfFirst { it.startsWith("m=video") }
+        if (mIdx < 0) return sdp
+        val h264 = lines
+            .filter { it.startsWith("a=rtpmap:") && it.contains(" H264/") }
+            .map { it.substringAfter("a=rtpmap:").substringBefore(" ") }
+        if (h264.isEmpty()) return sdp
+        val parts = lines[mIdx].split(" ")
+        if (parts.size <= 3) return sdp
+        val pts = parts.subList(3, parts.size)
+        val reordered = h264.filter { it in pts } + pts.filter { it !in h264 }
+        val out = lines.toMutableList()
+        out[mIdx] = (parts.subList(0, 3) + reordered).joinToString(" ")
+        return out.joinToString("\r\n")
     }
 
     private fun dispatchInput(slot: Int, btn: Int, down: Boolean) {
@@ -443,16 +458,6 @@ class GameActivity : AppCompatActivity() {
     private lateinit var statusView: TextView
     private lateinit var streamBtn: TextView
 
-    private var gameKey = "game"
-    private val ui = Handler(Looper.getMainLooper())
-    private val scope = CoroutineScope(Dispatchers.Main)
-    private val autosave = object : Runnable {
-        override fun run() {
-            saveSram(false)
-            ui.postDelayed(this, 20000)
-        }
-    }
-
     private val projectionLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
             val data = r.data
@@ -480,15 +485,12 @@ class GameActivity : AppCompatActivity() {
             return
         }
 
-        gameKey = File(gamePath).nameWithoutExtension
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
 
         try {
             val data = GLRetroViewData(this).apply {
                 coreFilePath = "libpcsx_rearmed_libretro_android.so"
                 gameFilePath = gamePath
-                val sram = sramFile()
-                if (sram.exists()) saveRAMState = sram.readBytes()
                 systemDirectory = File(filesDir, "system").apply { mkdirs() }.absolutePath
                 savesDirectory = File(filesDir, "saves").apply { mkdirs() }.absolutePath
             }
@@ -505,121 +507,9 @@ class GameActivity : AppCompatActivity() {
         buildControls(root)
         buildStreamBar(root)
         setContentView(root)
-
-        ui.postDelayed(autosave, 20000)
-        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() {
-                exitGame()
-            }
-        })
-    }
-
-    override fun onPause() {
-        saveSram(false)
-        super.onPause()
-    }
-
-    // ---------- เซฟเกม / เมนู ----------
-    private fun savesDir(): File = File(filesDir, "saves").apply { mkdirs() }
-    private fun sramFile(): File = File(savesDir(), "$gameKey.srm")
-    private fun stateFile(n: Int): File = File(savesDir(), "$gameKey.state$n")
-
-    private fun toast(t: String) {
-        Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
-    }
-
-    /** บันทึกเมมการ์ดของเกม (ที่เกมเซฟลงไป) ลงไฟล์ในแอป */
-    private fun saveSram(showToast: Boolean) {
-        val v = retroView ?: return
-        scope.launch {
-            try {
-                val bytes = v.serializeSRAM()
-                if (bytes.isNotEmpty()) {
-                    sramFile().writeBytes(bytes)
-                    if (showToast) toast("บันทึกเมมการ์ดแล้ว")
-                } else if (showToast) {
-                    toast("ยังไม่มีข้อมูลเมมการ์ดให้บันทึก")
-                }
-            } catch (e: Throwable) {
-                if (showToast) toast("บันทึกเมมการ์ดไม่สำเร็จ: ${e.message}")
-            }
-        }
-    }
-
-    private fun saveState(n: Int) {
-        val v = retroView ?: return
-        scope.launch {
-            try {
-                val bytes = v.serializeState()
-                stateFile(n).writeBytes(bytes)
-                toast("บันทึกสถานะช่อง $n แล้ว")
-            } catch (e: Throwable) {
-                toast("บันทึกสถานะไม่สำเร็จ: ${e.message}")
-            }
-        }
-    }
-
-    private fun loadState(n: Int) {
-        val v = retroView ?: return
-        val f = stateFile(n)
-        if (!f.exists()) {
-            toast("ช่อง $n ยังว่างอยู่")
-            return
-        }
-        scope.launch {
-            try {
-                v.unserializeState(f.readBytes())
-                toast("โหลดสถานะช่อง $n แล้ว")
-            } catch (e: Throwable) {
-                toast("โหลดสถานะไม่สำเร็จ: ${e.message}")
-            }
-        }
-    }
-
-    private fun exitGame() {
-        val v = retroView
-        if (v == null) {
-            finish()
-            return
-        }
-        scope.launch {
-            try {
-                val bytes = v.serializeSRAM()
-                if (bytes.isNotEmpty()) sramFile().writeBytes(bytes)
-            } catch (e: Throwable) {
-                // เซฟไม่ได้ก็ออกต่อ
-            }
-            finish()
-        }
-    }
-
-    private fun showMenu() {
-        val v = retroView ?: return
-        val items = arrayOf(
-            "💾 บันทึกสถานะ ช่อง 1", "💾 บันทึกสถานะ ช่อง 2", "💾 บันทึกสถานะ ช่อง 3",
-            "📂 โหลดสถานะ ช่อง 1", "📂 โหลดสถานะ ช่อง 2", "📂 โหลดสถานะ ช่อง 3",
-            "💳 บันทึกเมมการ์ดตอนนี้",
-            if (v.audioEnabled) "🔇 ปิดเสียงเกม" else "🔊 เปิดเสียงเกม",
-            "🔄 รีเซ็ตเกม",
-            "❌ ออกจากเกม"
-        )
-        AlertDialog.Builder(this)
-            .setTitle("เมนู")
-            .setItems(items) { _, i ->
-                when (i) {
-                    0, 1, 2 -> { saveState(i + 1) }
-                    3, 4, 5 -> { loadState(i - 2) }
-                    6 -> { saveSram(true) }
-                    7 -> { v.audioEnabled = !v.audioEnabled }
-                    8 -> { v.reset() }
-                    9 -> { exitGame() }
-                }
-            }
-            .show()
     }
 
     override fun onDestroy() {
-        ui.removeCallbacks(autosave)
         streamer?.stop()
         streamer = null
         stopService(Intent(this, StreamService::class.java))
@@ -651,15 +541,6 @@ class GameActivity : AppCompatActivity() {
                 projectionLauncher.launch(mpm.createScreenCaptureIntent())
             }
         }
-        val gear = TextView(this).apply {
-            text = "⚙"
-            textSize = 18f
-            setTextColor(Color.WHITE)
-            setPadding(dp(12), dp(2), dp(12), dp(2))
-            background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.argb(140, 0, 0, 0)) }
-            setOnClickListener { showMenu() }
-        }
-        bar.addView(gear, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(8) })
         bar.addView(statusView)
         bar.addView(streamBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(8) })
         root.addView(bar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -674,26 +555,38 @@ class GameActivity : AppCompatActivity() {
         statusView.text = "กำลังเริ่มสตรีม…"
         val room = getSharedPreferences("dokapon", MODE_PRIVATE).getString("room", "DOKAPN") ?: "DOKAPN"
         val dm = resources.displayMetrics
-        // รอให้ service ขึ้นเป็น foreground ก่อน แล้วค่อยเริ่มจับภาพ (ข้อกำหนดของ Android 14)
+        // จับภาพที่ความสูง 480 พอดีกับสตรีม 640x480 (ไม่ต้องย่อภาพอีกรอบ GPU ทำงานน้อยลง)
+        val longSide = maxOf(dm.widthPixels, dm.heightPixels)
+        val shortSide = minOf(dm.widthPixels, dm.heightPixels)
+        val capH = minOf(480, shortSide)
+        val capW = (longSide * capH / shortSide) and 1.inv()
+        // รอให้ service ขึ้นเป็น foreground ก่อน (ข้อกำหนดของ Android 14) แล้วสร้างตัวสตรีมในเธรดเบื้องหลัง
+        // เพื่อไม่ให้งานหนักตอนโหลด WebRTC/ตรวจโคเดกไปบล็อกหน้าจอเกม
         Handler(Looper.getMainLooper()).postDelayed({
-            try {
-                val s = Streamer(
-                    this, data, room, dm.widthPixels / 3, dm.heightPixels / 3,
-                    { slot, btn, down ->
-                        val code = PadMap.code(btn)
-                        if (code != null) {
-                            retroView?.sendKeyEvent(if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP, code, slot)
-                        }
-                    },
-                    { text -> runOnUiThread { statusView.text = text } }
-                )
-                streamer = s
-                s.start()
-            } catch (e: Throwable) {
-                Toast.makeText(this, "เริ่มสตรีมไม่สำเร็จ: ${e.message ?: e}", Toast.LENGTH_LONG).show()
-                statusView.text = "สตรีมไม่สำเร็จ"
-                streamBtn.visibility = View.VISIBLE
-            }
+            Thread {
+                try {
+                    val s = Streamer(
+                        this, data, room, capW, capH,
+                        { slot, btn, down ->
+                            val code = PadMap.code(btn)
+                            if (code != null) {
+                                retroView?.sendKeyEvent(if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP, code, slot)
+                            }
+                        },
+                        { text -> runOnUiThread { statusView.text = text } }
+                    )
+                    s.start()
+                    runOnUiThread {
+                        if (isDestroyed) s.stop() else streamer = s
+                    }
+                } catch (e: Throwable) {
+                    runOnUiThread {
+                        Toast.makeText(this, "เริ่มสตรีมไม่สำเร็จ: ${e.message ?: e}", Toast.LENGTH_LONG).show()
+                        statusView.text = "สตรีมไม่สำเร็จ"
+                        streamBtn.visibility = View.VISIBLE
+                    }
+                }
+            }.start()
         }, 700)
     }
 
