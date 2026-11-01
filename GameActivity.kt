@@ -64,11 +64,13 @@ import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
+import org.webrtc.RendererCommon
 import org.webrtc.RtpReceiver
 import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
+import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoFrame
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
@@ -876,6 +878,356 @@ class GameActivity : AppCompatActivity() {
         val mid = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         mid.addView(pad("Select", KeyEvent.KEYCODE_BUTTON_SELECT), LinearLayout.LayoutParams(dp(78), dp(34)).apply { rightMargin = dp(10) })
         mid.addView(pad("Start", KeyEvent.KEYCODE_BUTTON_START), LinearLayout.LayoutParams(dp(78), dp(34)))
+        root.addView(mid, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            bottomMargin = margin
+        })
+    }
+}
+
+
+/**
+ * โหมดผู้เล่นแบบเนทีฟทั้งหมด (ไม่ใช้เว็บ/WebView):
+ * รับภาพสตรีมจากโฮสต์ด้วย WebRTC แล้วส่งปุ่มกลับทาง DataChannel
+ */
+class PlayerActivity : AppCompatActivity() {
+
+    private val main = Handler(Looper.getMainLooper())
+    private var eglBase: EglBase? = null
+    private var factory: PeerConnectionFactory? = null
+    private var sig: Signaling? = null
+    private var pc: PeerConnection? = null
+    private var channel: DataChannel? = null
+    private var renderer: SurfaceViewRenderer? = null
+    private lateinit var statusView: TextView
+    private lateinit var badge: TextView
+    private var hostId = ""
+    private var joined = false
+    private var finished = false
+    private var remoteSet = false
+    private val pending = ArrayList<IceCandidate>()
+    private val held = HashSet<Int>()
+    private var padAlpha = 0.55f
+    private var padScale = 1f
+    private var swapLocal = false
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+
+        val room = intent.getStringExtra("room") ?: ""
+        val name = intent.getStringExtra("name") ?: ""
+        hostId = "dokapon-$room"
+
+        val settings = getSharedPreferences("dokapon", MODE_PRIVATE)
+        padAlpha = settings.getInt("ui_alpha", 55) / 100f
+        padScale = settings.getInt("ui_scale", 100) / 100f
+        swapLocal = settings.getBoolean("swap_ab", false)
+
+        val egl = EglBase.create()
+        eglBase = egl
+        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val r = SurfaceViewRenderer(this)
+        r.init(egl.eglBaseContext, null)
+        r.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+        r.setEnableHardwareScaler(true)
+        renderer = r
+        root.addView(r, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        statusView = TextView(this).apply {
+            text = "กำลังเชื่อมต่อห้อง $room…"
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setPadding(dp(24), dp(12), dp(24), dp(12))
+            background = GradientDrawable().apply { cornerRadius = dp(16).toFloat(); setColor(Color.argb(150, 0, 0, 0)) }
+        }
+        root.addView(statusView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.CENTER
+        })
+        badge = TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.BLACK)
+            setPadding(dp(10), dp(3), dp(10), dp(3))
+            background = GradientDrawable().apply { cornerRadius = dp(12).toFloat(); setColor(Color.rgb(242, 193, 78)) }
+            visibility = View.GONE
+        }
+        root.addView(badge, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            topMargin = dp(6)
+        })
+
+        buildPad(root)
+        setContentView(root)
+
+        PeerConnectionFactory.initialize(
+            PeerConnectionFactory.InitializationOptions.builder(applicationContext).createInitializationOptions()
+        )
+        factory = PeerConnectionFactory.builder()
+            .setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true))
+            .setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext))
+            .createPeerConnectionFactory()
+
+        val chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+        val rnd = java.security.SecureRandom()
+        val myId = "friend-" + (1..10).map { chars[rnd.nextInt(chars.length)] }.joinToString("")
+        sig = Signaling(myId, object : Signaling.Listener {
+            override fun onMessage(type: String, src: String?, payload: JSONObject?) {
+                if (finished) return
+                when (type) {
+                    "OPEN" -> sig?.send("OFFER", hostId, JSONObject().put("t", "join").put("name", name))
+                    "ID-TAKEN" -> fail("เชื่อมต่อชนกัน ลองเข้าห้องใหม่อีกครั้ง")
+                    "EXPIRE" -> if (!joined) fail("ไม่พบห้องนี้ ตรวจรหัสห้อง และรอให้โฮสต์เริ่มเกมก่อน")
+                    "ERROR" -> fail("เซิร์ฟเวอร์จับคู่แจ้งข้อผิดพลาด")
+                    "ANSWER" -> {
+                        if (payload != null) {
+                            val kind = payload.optString("t")
+                            if (kind == "joined") onJoined(payload.optInt("slot"))
+                            else if (kind == "full") fail("ห้องเต็มแล้ว")
+                        }
+                    }
+                    "OFFER" -> {
+                        if (payload != null && payload.optString("t") == "sdp") onOffer(payload.optString("sdp"))
+                    }
+                    "CANDIDATE" -> {
+                        if (payload != null && payload.optString("t") == "ice") {
+                            val c = IceCandidate(
+                                payload.optString("sdpMid"), payload.optInt("sdpMLineIndex"), payload.optString("candidate")
+                            )
+                            val conn = pc
+                            if (conn != null && remoteSet) conn.addIceCandidate(c) else pending.add(c)
+                        }
+                    }
+                }
+            }
+        })
+        sig?.connect()
+
+        main.postDelayed({
+            if (!joined && !finished) fail("เข้าห้องไม่สำเร็จ ตรวจรหัสห้อง และตรวจว่าโฮสต์เริ่มเกมแล้ว")
+        }, 20000)
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                leave()
+            }
+        })
+    }
+
+    private fun onJoined(slot: Int) {
+        joined = true
+        badge.text = "ผู้เล่น ${slot + 1}"
+        badge.visibility = View.VISIBLE
+        statusView.text = "กำลังรอภาพจากโฮสต์…"
+    }
+
+    private fun onOffer(sdp: String) {
+        val f = factory ?: return
+        pc?.close()
+        remoteSet = false
+        val servers = listOf(
+            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
+            PeerConnection.IceServer.builder("turn:eu-0.turn.peerjs.com:3478")
+                .setUsername("peerjs").setPassword("peerjsp").createIceServer()
+        )
+        val config = PeerConnection.RTCConfiguration(servers)
+        config.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+
+        val c = f.createPeerConnection(config, object : PeerConnection.Observer {
+            override fun onSignalingChange(s: PeerConnection.SignalingState?) {}
+            override fun onIceConnectionChange(s: PeerConnection.IceConnectionState?) {
+                main.post {
+                    when (s) {
+                        PeerConnection.IceConnectionState.FAILED -> fail("เชื่อมต่อภาพไม่สำเร็จ ลองสลับ Wi-Fi/เน็ตมือถือ")
+                        PeerConnection.IceConnectionState.DISCONNECTED -> statusView.apply {
+                            text = "สัญญาณสะดุด กำลังพยายามต่อใหม่…"
+                            visibility = View.VISIBLE
+                        }
+                        PeerConnection.IceConnectionState.CONNECTED,
+                        PeerConnection.IceConnectionState.COMPLETED -> statusView.visibility = View.GONE
+                        else -> {}
+                    }
+                }
+            }
+            override fun onIceConnectionReceivingChange(b: Boolean) {}
+            override fun onIceGatheringChange(s: PeerConnection.IceGatheringState?) {}
+            override fun onIceCandidate(c: IceCandidate?) {
+                if (c == null) return
+                sig?.send(
+                    "CANDIDATE", hostId,
+                    JSONObject().put("t", "ice").put("candidate", c.sdp)
+                        .put("sdpMid", c.sdpMid).put("sdpMLineIndex", c.sdpMLineIndex)
+                )
+            }
+            override fun onIceCandidatesRemoved(c: Array<out IceCandidate>?) {}
+            override fun onAddStream(s: MediaStream?) {}
+            override fun onRemoveStream(s: MediaStream?) {}
+            override fun onDataChannel(d: DataChannel?) {
+                channel = d
+            }
+            override fun onRenegotiationNeeded() {}
+            override fun onAddTrack(r: RtpReceiver?, s: Array<out MediaStream>?) {
+                val t = r?.track()
+                if (t is VideoTrack) {
+                    main.post {
+                        renderer?.let { t.addSink(it) }
+                        statusView.visibility = View.GONE
+                    }
+                }
+            }
+        }) ?: return
+        pc = c
+
+        c.setRemoteDescription(object : SdpAdapter() {
+            override fun onSetSuccess() {
+                main.post {
+                    remoteSet = true
+                    pending.forEach { c.addIceCandidate(it) }
+                    pending.clear()
+                }
+                c.createAnswer(SdpAdapter { ans ->
+                    c.setLocalDescription(SdpAdapter(), ans)
+                    sig?.send(
+                        "ANSWER", hostId,
+                        JSONObject().put("t", "sdp").put("type", "answer").put("sdp", ans.description)
+                    )
+                }, MediaConstraints())
+            }
+        }, SessionDescription(SessionDescription.Type.OFFER, sdp))
+    }
+
+    private fun fail(msg: String) {
+        if (finished) return
+        statusView.text = "$msg (แตะเพื่อออก)"
+        statusView.visibility = View.VISIBLE
+        statusView.setOnClickListener { leave() }
+    }
+
+    private fun leave() {
+        if (finished) return
+        sig?.send("LEAVE", hostId, JSONObject())
+        finish()
+    }
+
+    override fun onPause() {
+        held.toList().forEach { sendBtn(it, false) }
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        finished = true
+        main.removeCallbacksAndMessages(null)
+        try { sig?.close() } catch (e: Exception) { }
+        try { channel?.close() } catch (e: Exception) { }
+        try { pc?.close() } catch (e: Exception) { }
+        try { renderer?.release() } catch (e: Exception) { }
+        try { factory?.dispose() } catch (e: Exception) { }
+        try { eglBase?.release() } catch (e: Exception) { }
+        super.onDestroy()
+    }
+
+    // ---------- ส่งปุ่มให้โฮสต์ (รหัสปุ่มแบบ RetroPad) ----------
+    private fun sendBtn(idx: Int, down: Boolean) {
+        if (down == held.contains(idx)) return
+        if (down) held.add(idx) else held.remove(idx)
+        val ch = channel ?: return
+        if (ch.state() != DataChannel.State.OPEN) return
+        val j = JSONObject().put("b", idx).put("d", if (down) 1 else 0).toString()
+        ch.send(DataChannel.Buffer(java.nio.ByteBuffer.wrap(j.toByteArray()), false))
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun pad(label: String, idx: Int, circle: Boolean = false): TextView {
+        return TextView(this).apply {
+            text = label
+            gravity = Gravity.CENTER
+            textSize = 18f
+            setTextColor(Color.WHITE)
+            alpha = padAlpha
+            background = GradientDrawable().apply {
+                shape = if (circle) GradientDrawable.OVAL else GradientDrawable.RECTANGLE
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.argb(110, 32, 32, 64))
+                setStroke(dp(2), Color.argb(190, 255, 255, 255))
+            }
+            setOnTouchListener { v, e ->
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        v.alpha = 1f
+                        sendBtn(idx, true)
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        v.alpha = padAlpha
+                        sendBtn(idx, false)
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    private fun place(parent: FrameLayout, v: TextView, x: Int, y: Int, w: Int, h: Int) {
+        parent.addView(v, FrameLayout.LayoutParams(w, h).apply {
+            gravity = Gravity.TOP or Gravity.START
+            leftMargin = x
+            topMargin = y
+        })
+    }
+
+    private fun buildPad(root: FrameLayout) {
+        val cell = (dp(54) * padScale).toInt()
+        val gap = dp(4)
+        val step = cell + gap
+        val size = cell * 3 + gap * 2
+        val margin = dp(16)
+
+        val dpad = FrameLayout(this)
+        place(dpad, pad("▲", 4), step, 0, cell, cell)
+        place(dpad, pad("◀", 6), 0, step, cell, cell)
+        place(dpad, pad("▶", 7), step * 2, step, cell, cell)
+        place(dpad, pad("▼", 5), step, step * 2, cell, cell)
+        root.addView(dpad, FrameLayout.LayoutParams(size, size).apply {
+            gravity = Gravity.BOTTOM or Gravity.START
+            leftMargin = margin
+            bottomMargin = margin
+        })
+
+        val face = FrameLayout(this)
+        place(face, pad("△", 9, true), step, 0, cell, cell)
+        place(face, pad("□", 1, true), 0, step, cell, cell)
+        place(face, pad("○", if (swapLocal) 0 else 8, true), step * 2, step, cell, cell)
+        place(face, pad("✕", if (swapLocal) 8 else 0, true), step, step * 2, cell, cell)
+        root.addView(face, FrameLayout.LayoutParams(size, size).apply {
+            gravity = Gravity.BOTTOM or Gravity.END
+            rightMargin = margin
+            bottomMargin = margin
+        })
+
+        val sw = (dp(84) * padScale).toInt()
+        val sh = (dp(40) * padScale).toInt()
+        val top = dp(10)
+        fun shoulder(label: String, idx: Int, left: Boolean, row: Int) {
+            root.addView(pad(label, idx), FrameLayout.LayoutParams(sw, sh).apply {
+                gravity = Gravity.TOP or (if (left) Gravity.START else Gravity.END)
+                if (left) leftMargin = margin else rightMargin = margin
+                topMargin = top + row * (sh + dp(6))
+            })
+        }
+        shoulder("L2", 12, true, 0)
+        shoulder("L1", 10, true, 1)
+        shoulder("R2", 13, false, 0)
+        shoulder("R1", 11, false, 1)
+
+        val mid = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        mid.addView(pad("Select", 2), LinearLayout.LayoutParams(dp(78), dp(34)).apply { rightMargin = dp(10) })
+        mid.addView(pad("Start", 3), LinearLayout.LayoutParams(dp(78), dp(34)))
         root.addView(mid, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
             bottomMargin = margin

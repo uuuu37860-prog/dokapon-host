@@ -14,8 +14,6 @@ import android.text.InputFilter
 import android.view.Gravity
 import android.view.ViewGroup
 import android.view.WindowManager
-import android.webkit.WebChromeClient
-import android.webkit.WebView
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -51,7 +49,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var biosInfo: TextView
     private lateinit var startBtn: TextView
     private lateinit var roomText: TextView
-    private lateinit var urlEdit: EditText
     private lateinit var hostSection: LinearLayout
     private lateinit var playerSection: LinearLayout
     private lateinit var tabHost: TextView
@@ -83,10 +80,6 @@ class MainActivity : AppCompatActivity() {
             prefs().edit().putString("room", r).apply()
         }
         return r
-    }
-
-    private fun pageUrl(): String {
-        return prefs().getString("page", null) ?: "https://bom979229-boop.github.io/Dokapon/play.html"
     }
 
     // ---------- ชิ้นส่วน UI ----------
@@ -289,9 +282,6 @@ class MainActivity : AppCompatActivity() {
             prefs().edit().putString("room", newRoom()).apply()
             roomText.text = room()
         })
-        roomCard.addView(note("ลิงก์หน้าเว็บสำหรับเพื่อนที่ไม่ลงแอป (เช่น iPhone)"))
-        urlEdit = field("https://.../play.html").apply { setText(pageUrl()); textSize = 13f }
-        roomCard.addView(urlEdit)
         hostSection.addView(roomCard)
         root.addView(hostSection)
 
@@ -337,11 +327,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun shareRoom() {
-        val url = urlEdit.text.toString().trim()
-        prefs().edit().putString("page", url).apply()
-        val sep = if (url.contains("?")) "&" else "?"
-        val web = if (url.isNotEmpty()) "\nไม่ลงแอป (เช่น iPhone) เปิดลิงก์นี้: $url${sep}room=${room()}" else ""
-        val text = "เล่น Dokapon ด้วยกัน!\nรหัสห้อง: ${room()}\nติดตั้งแอป Dokapon Host แล้วไปแท็บ \"ผู้เล่น\" ใส่รหัสนี้$web"
+        val text = "เล่น Dokapon ด้วยกัน!\nรหัสห้อง: ${room()}\nติดตั้งแอป Dokapon Host แล้วไปแท็บ \"ผู้เล่น\" ใส่รหัสนี้ (ไม่ต้องมีไฟล์เกม)"
         val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
         startActivity(Intent.createChooser(send, "แชร์รหัสห้อง"))
     }
@@ -525,338 +511,4 @@ fun showSettingsDialog(a: AppCompatActivity) {
         .setView(ScrollView(a).apply { addView(box) })
         .setPositiveButton("ปิด", null)
         .show()
-}
-
-
-/** โหมดผู้เล่น: เปิดหน้าเล่นที่ฝังไว้ในแอปผ่าน WebView (ไม่ต้องพึ่งเว็บภายนอก) */
-class PlayerActivity : AppCompatActivity() {
-    private var web: WebView? = null
-
-    @android.annotation.SuppressLint("SetJavaScriptEnabled")
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        WindowInsetsControllerCompat(window, window.decorView).apply {
-            hide(WindowInsetsCompat.Type.systemBars())
-            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        }
-
-        val room = intent.getStringExtra("room") ?: ""
-        val name = intent.getStringExtra("name") ?: ""
-
-        val w = WebView(this)
-        w.setBackgroundColor(Color.BLACK)
-        w.settings.javaScriptEnabled = true
-        w.settings.domStorageEnabled = true
-        w.settings.mediaPlaybackRequiresUserGesture = false
-        w.webChromeClient = WebChromeClient()
-        web = w
-        setContentView(w)
-
-        val base = "https://dokapon.local/play.html?room=" + Uri.encode(room) +
-            "&name=" + Uri.encode(name) + "&auto=1"
-        w.loadDataWithBaseURL(base, PlayerPage.HTML, "text/html", "utf-8", null)
-    }
-
-    override fun onResume() {
-        super.onResume()
-        web?.onResume()
-    }
-
-    override fun onPause() {
-        web?.onPause()
-        super.onPause()
-    }
-
-    override fun onDestroy() {
-        web?.destroy()
-        web = null
-        super.onDestroy()
-    }
-}
-
-object PlayerPage {
-    const val HTML = """<!doctype html>
-<html lang="th">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
-<title>Dokapon Online — ผู้เล่น</title>
-<style>
-:root{
-  --bg:#14122b; --panel:#201d42; --key:#2c2859; --ink:#f3efe6; --dim:#9a96c0;
-  --tri:#4fb286; --cir:#e4586b; --crs:#5b7fe8; --sqr:#d88ac2; --gold:#f2c14e;
-}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;touch-action:none}
-html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);overflow:hidden;
-  font-family:ui-rounded,"Hiragino Maru Gothic ProN","Noto Sans Thai","Sarabun",system-ui,sans-serif}
-input{-webkit-user-select:text;user-select:text;touch-action:auto}
-.hidden{display:none!important}
-
-/* ---------- หน้าเข้าห้อง ---------- */
-#join{height:100%;display:flex;align-items:center;justify-content:center;padding:24px}
-#join form{width:min(380px,100%);display:grid;gap:14px}
-#join h1{margin:0 0 4px;font-size:30px;line-height:1.15;letter-spacing:.01em}
-#join p{margin:0;color:var(--dim);font-size:15px;line-height:1.5}
-label{display:grid;gap:6px;font-size:14px;color:var(--dim)}
-input{font:inherit;font-size:20px;color:var(--ink);background:var(--panel);border:2px solid var(--key);
-  border-radius:14px;padding:12px 14px;outline:none}
-input:focus-visible{border-color:var(--gold)}
-#code{letter-spacing:.3em;text-transform:uppercase;text-align:center;font-weight:700}
-button.primary{font:inherit;font-size:18px;font-weight:700;color:#1b1630;background:var(--gold);
-  border:0;border-radius:14px;padding:14px;touch-action:manipulation}
-button.primary:active{transform:translateY(1px)}
-#err{color:#ff8fa0;font-size:15px;min-height:1.3em}
-
-/* ---------- หน้าเล่น ---------- */
-#game{height:100%;display:flex;flex-direction:column}
-.stage{flex:1;min-height:0;background:#000;position:relative}
-video{width:100%;height:100%;object-fit:contain;background:#000}
-#status{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-  text-align:center;padding:20px;color:var(--dim);font-size:16px;line-height:1.5;pointer-events:none}
-#badge{position:absolute;top:calc(8px + env(safe-area-inset-top));left:10px;font-size:13px;font-weight:700;
-  color:#1b1630;background:var(--gold);padding:4px 10px;border-radius:999px;pointer-events:none}
-#sound{position:absolute;top:calc(8px + env(safe-area-inset-top));right:10px;font:inherit;font-size:13px;
-  color:var(--ink);background:rgba(32,29,66,.9);border:1px solid var(--key);border-radius:999px;padding:5px 12px;touch-action:manipulation}
-
-.pad{display:grid;grid-template-columns:1fr auto 1fr;align-items:end;gap:10px;
-  padding:10px 14px calc(12px + env(safe-area-inset-bottom));background:var(--panel)}
-.side{display:grid;gap:10px;justify-items:center}
-.shoulders{display:flex;gap:10px;width:100%;justify-content:center}
-.sh{flex:1;max-width:96px;height:38px;border-radius:12px;font-weight:700;font-size:15px}
-.btn{display:flex;align-items:center;justify-content:center;color:var(--ink);background:var(--key);
-  border:2px solid #3b3672;border-radius:14px;font-weight:700;touch-action:none}
-.btn.on{background:var(--gold);color:#1b1630;border-color:var(--gold);transform:scale(.95)}
-
-.dpad{display:grid;grid-template-columns:repeat(3,54px);grid-template-rows:repeat(3,54px);gap:4px}
-.dpad .btn{font-size:22px;border-radius:12px}
-.u{grid-area:1/2}.l{grid-area:2/1}.r{grid-area:2/3}.d{grid-area:3/2}
-.face{display:grid;grid-template-columns:repeat(3,54px);grid-template-rows:repeat(3,54px);gap:4px}
-.face .btn{border-radius:50%;font-size:24px;border-width:3px}
-.f-tri{grid-area:1/2;border-color:var(--tri);color:var(--tri)}
-.f-sqr{grid-area:2/1;border-color:var(--sqr);color:var(--sqr)}
-.f-cir{grid-area:2/3;border-color:var(--cir);color:var(--cir)}
-.f-crs{grid-area:3/2;border-color:var(--crs);color:var(--crs)}
-.face .btn.on{color:#1b1630}
-.mid{display:grid;gap:8px;padding-bottom:6px}
-.mid .btn{width:76px;height:34px;font-size:13px;border-radius:999px}
-
-/* แนวนอน: ปุ่มลอยทับภาพ */
-@media (orientation:landscape) and (max-height:560px){
-  #game{position:relative}
-  .stage{position:absolute;inset:0}
-  .pad{position:absolute;left:0;right:0;bottom:0;background:none;pointer-events:none;
-    padding:0 calc(16px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left))}
-  .pad .btn{pointer-events:auto;opacity:.6;background:rgba(32,29,66,.85)}
-  .pad .btn.on{opacity:.95;background:var(--gold)}
-  .dpad,.face{grid-template-columns:repeat(3,48px);grid-template-rows:repeat(3,48px)}
-  .sh{height:32px}
-}
-</style>
-</head>
-<body>
-
-<div id="join">
-  <form id="joinForm" autocomplete="off">
-    <h1>เข้าห้อง Dokapon</h1>
-    <p>ใส่รหัสห้องที่เพื่อนส่งให้ แล้วกดเข้าห้อง จอเกมจะขึ้นมาทันทีที่โฮสต์เริ่มสตรีม</p>
-    <label>รหัสห้อง<input id="code" maxlength="6" inputmode="text" autocapitalize="characters" required></label>
-    <label>ชื่อของคุณ<input id="name" maxlength="20" placeholder="เช่น Bom"></label>
-    <button class="primary" id="joinBtn" type="submit">เข้าห้อง</button>
-    <div id="err" role="alert"></div>
-  </form>
-</div>
-
-<div id="game" class="hidden">
-  <div class="stage">
-    <video id="v" autoplay playsinline muted></video>
-    <div id="status">กำลังรอโฮสต์เริ่มสตรีม…</div>
-    <div id="badge"></div>
-    <button id="sound" class="hidden">แตะเพื่อเปิดเสียง</button>
-  </div>
-  <div class="pad">
-    <div class="side">
-      <div class="shoulders">
-        <div class="btn sh" data-b="12">L2</div>
-        <div class="btn sh" data-b="10">L1</div>
-      </div>
-      <div class="dpad">
-        <div class="btn u" data-b="4">▲</div>
-        <div class="btn l" data-b="6">◀</div>
-        <div class="btn r" data-b="7">▶</div>
-        <div class="btn d" data-b="5">▼</div>
-      </div>
-    </div>
-    <div class="mid">
-      <div class="btn" data-b="2">Select</div>
-      <div class="btn" data-b="3">Start</div>
-    </div>
-    <div class="side">
-      <div class="shoulders">
-        <div class="btn sh" data-b="11">R1</div>
-        <div class="btn sh" data-b="13">R2</div>
-      </div>
-      <div class="face">
-        <div class="btn f-tri" data-b="9">△</div>
-        <div class="btn f-sqr" data-b="1">□</div>
-        <div class="btn f-cir" data-b="8">○</div>
-        <div class="btn f-crs" data-b="0">✕</div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<script>
-// หน้าเพื่อนสำหรับโหมด "โฮสต์เป็นแอปบนมือถือ"
-// ใช้เซิร์ฟเวอร์ฟรีของ PeerJS เป็นแค่ตัวส่งต่อข้อความจับคู่ ภาพวิ่งตรงมาจากมือถือโฮสต์ด้วย WebRTC
-// รหัสปุ่มแบบ RetroPad: 0=✕ 1=□ 2=Select 3=Start 4=ขึ้น 5=ลง 6=ซ้าย 7=ขวา 8=○ 9=△ 10=L1 11=R1 12=L2 13=R2
-const SIGNAL = 'wss://0.peerjs.com/peerjs?key=peerjs';
-const ICE = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'turn:eu-0.turn.peerjs.com:3478', username: 'peerjs', credential: 'peerjsp' },
-];
-const ${'$'} = (id) => document.getElementById(id);
-const v = ${'$'}('v');
-let ws = null, pc = null, dc = null, hb = null, hostId = '', joined = false, chain = Promise.resolve(), pending = [], wl = null;
-
-const params = new URLSearchParams(location.search);
-if (params.get('room')) ${'$'}('code').value = params.get('room').toUpperCase();
-try { ${'$'}('name').value = localStorage.getItem('dokapon-name') || ''; } catch (e) {}
-
-function rnd(n) {
-  const a = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  return Array.from(crypto.getRandomValues(new Uint8Array(n)), (x) => a[x % a.length]).join('');
-}
-function send(type, payload) {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type, dst: hostId, payload }));
-}
-function setStatus(t) { ${'$'}('status').textContent = t; ${'$'}('status').classList.toggle('hidden', !t); }
-async function keepAwake() { try { if ('wakeLock' in navigator) wl = await navigator.wakeLock.request('screen'); } catch (e) {} }
-
-${'$'}('joinForm').addEventListener('submit', (e) => {
-  e.preventDefault();
-  ${'$'}('err').textContent = '';
-  const room = ${'$'}('code').value.trim().toUpperCase();
-  const name = ${'$'}('name').value.trim();
-  if (!room) return;
-  try { localStorage.setItem('dokapon-name', name); } catch (e2) {}
-  hostId = 'dokapon-' + room;
-  ${'$'}('joinBtn').disabled = true;
-  ${'$'}('joinBtn').textContent = 'กำลังเชื่อมต่อ…';
-
-  ws = new WebSocket(SIGNAL + '&id=friend-' + rnd(10) + '&token=' + rnd(12));
-  ws.onopen = () => { hb = setInterval(() => { if (ws.readyState === 1) ws.send('{"type":"HEARTBEAT"}'); }, 5000); };
-  ws.onmessage = (ev) => { try { onMsg(JSON.parse(ev.data), name); } catch (e3) { console.error(e3); } };
-  ws.onclose = () => { clearInterval(hb); if (joined) fail('หลุดการเชื่อมต่อ'); };
-  ws.onerror = () => fail('เชื่อมต่อเซิร์ฟเวอร์จับคู่ไม่ได้');
-  setTimeout(() => { if (!joined) fail('เข้าห้องไม่สำเร็จ ตรวจรหัสห้อง และตรวจว่าโฮสต์เปิดสตรีมแล้ว'); }, 20000);
-});
-
-function onMsg(m, name) {
-  const p = m.payload || {};
-  if (m.type === 'OPEN') send('OFFER', { t: 'join', name });
-  else if (m.type === 'ID-TAKEN') fail('เชื่อมต่อชนกัน ลองใหม่อีกครั้ง');
-  else if (m.type === 'EXPIRE' && !joined) fail('ไม่พบห้องนี้ ตรวจรหัสห้อง หรือโฮสต์ยังไม่ได้เปิดสตรีม');
-  else if (m.type === 'ERROR') fail('เซิร์ฟเวอร์จับคู่แจ้งข้อผิดพลาด');
-  else if (m.type === 'ANSWER' && p.t === 'joined') showGame(p.slot);
-  else if (m.type === 'ANSWER' && p.t === 'full') fail('ห้องเต็มแล้ว');
-  else if (m.type === 'OFFER' && p.t === 'sdp') chain = chain.then(() => onOffer(p)).catch(console.error);
-  else if (m.type === 'CANDIDATE' && p.t === 'ice') {
-    const c = { candidate: p.candidate, sdpMid: p.sdpMid, sdpMLineIndex: p.sdpMLineIndex };
-    if (pc && pc.remoteDescription) pc.addIceCandidate(c).catch(() => {});
-    else pending.push(c);
-  }
-}
-
-function showGame(slot) {
-  joined = true;
-  ${'$'}('join').classList.add('hidden');
-  ${'$'}('game').classList.remove('hidden');
-  ${'$'}('badge').textContent = 'ผู้เล่น ' + (slot + 1);
-  setStatus('กำลังรอภาพจากโฮสต์…');
-  keepAwake();
-}
-
-function fail(msg) {
-  if (!${'$'}('game').classList.contains('hidden')) {
-    setStatus(msg + ' (แตะที่จอเพื่อโหลดใหม่)');
-    ${'$'}('status').style.pointerEvents = 'auto';
-    ${'$'}('status').onclick = () => location.reload();
-  } else {
-    ${'$'}('err').textContent = msg;
-    ${'$'}('joinBtn').disabled = false;
-    ${'$'}('joinBtn').textContent = 'เข้าห้อง';
-    try { if (ws) ws.close(); } catch (e) {}
-  }
-}
-
-async function onOffer(p) {
-  if (pc) pc.close();
-  pc = new RTCPeerConnection({ iceServers: ICE });
-  pc.ondatachannel = (e) => { dc = e.channel; };
-  pc.ontrack = (e) => {
-    v.srcObject = e.streams[0] || new MediaStream([e.track]);
-    try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0; } catch (e1) {}
-    try { if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0; } catch (e2) {}
-    v.muted = true;
-    v.play().catch(() => {});
-    setStatus('');
-  };
-  pc.onicecandidate = (e) => {
-    if (e.candidate) send('CANDIDATE', { t: 'ice', candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex });
-  };
-  pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'failed') setStatus('เชื่อมต่อภาพไม่สำเร็จ ลองสลับ Wi-Fi/เน็ตมือถือ');
-    else if (pc.connectionState === 'disconnected') setStatus('สัญญาณสะดุด กำลังพยายามต่อใหม่…');
-    else if (pc.connectionState === 'connected') setStatus('');
-  };
-  await pc.setRemoteDescription({ type: 'offer', sdp: p.sdp });
-  for (const c of pending.splice(0)) await pc.addIceCandidate(c).catch(() => {});
-  const ans = await pc.createAnswer();
-  await pc.setLocalDescription(ans);
-  send('ANSWER', { t: 'sdp', type: 'answer', sdp: pc.localDescription.sdp });
-}
-
-// ---------- ปุ่มควบคุม ----------
-const held = new Set();
-function setBtn(b, down) {
-  if (down === held.has(b)) return;
-  down ? held.add(b) : held.delete(b);
-  if (dc && dc.readyState === 'open') dc.send(JSON.stringify({ b, d: down ? 1 : 0 }));
-}
-document.querySelectorAll('[data-b]').forEach((el) => {
-  const b = Number(el.dataset.b);
-  const release = () => { el.classList.remove('on'); setBtn(b, false); };
-  el.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    try { el.setPointerCapture(e.pointerId); } catch (e1) {}
-    el.classList.add('on');
-    setBtn(b, true);
-    if (navigator.vibrate) navigator.vibrate(8);
-  });
-  el.addEventListener('pointerup', release);
-  el.addEventListener('pointercancel', release);
-  el.addEventListener('lostpointercapture', release);
-});
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) [...held].forEach((b) => setBtn(b, false));
-  else if (joined) keepAwake();
-});
-document.addEventListener('contextmenu', (e) => e.preventDefault());
-${'$'}('sound').addEventListener('click', () => { v.muted = false; v.play(); ${'$'}('sound').classList.add('hidden'); });
-
-// โหมดเข้าห้องอัตโนมัติ (ใช้ตอนเปิดจากในแอป)
-if (params.get('auto') === '1' && params.get('room')) {
-  if (params.get('name')) ${'$'}('name').value = params.get('name');
-  setTimeout(() => { ${'$'}('joinForm').dispatchEvent(new Event('submit', { cancelable: true })); }, 400);
-}
-
-const KEYS = { ArrowUp: 4, ArrowDown: 5, ArrowLeft: 6, ArrowRight: 7, z: 0, x: 8, a: 1, s: 9, q: 10, w: 11, Enter: 3, Shift: 2 };
-addEventListener('keydown', (e) => { if (e.target.tagName === 'INPUT' || e.repeat) return; const b = KEYS[e.key]; if (b !== undefined) { e.preventDefault(); setBtn(b, true); } });
-addEventListener('keyup', (e) => { const b = KEYS[e.key]; if (b !== undefined) setBtn(b, false); });
-</script>
-</body>
-</html>
-"""
 }
