@@ -282,7 +282,7 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { copyRoom() }
         }
         roomCard.addView(roomText)
-        roomCard.addView(note("แตะรหัสเพื่อคัดลอก เพื่อนที่ติดตั้งแอปนี้ใส่รหัสนี้ในแท็บ \"ผู้เล่น\""))
+        roomCard.addView(note("เริ่มเกมแล้วห้องจะเปิดให้เพื่อนเข้าทันที แตะรหัสเพื่อคัดลอก เพื่อนที่ติดตั้งแอปนี้ใส่รหัสนี้ในแท็บ \"ผู้เล่น\""))
         roomCard.addView(button("📨  แชร์รหัสห้อง", true) { shareRoom() })
         roomCard.addView(button("📦  ส่งแอปให้เพื่อน (ไฟล์ APK)", false) { shareApk() })
         roomCard.addView(button("🔄  สุ่มรหัสห้องใหม่", false) {
@@ -481,6 +481,7 @@ fun showSettingsDialog(a: AppCompatActivity) {
     seek("ขนาดปุ่มบนจอ", "ui_scale", 70, 140, 100, "%")
     toggle("สลับปุ่ม ✕ กับ ○ (ปุ่มบนจอของคุณ)", "swap_ab", false)
     toggle("โหมดประสิทธิภาพคงที่ (ช่วยลดอาการกระตุกเมื่อเครื่องร้อน)", "sustained", true)
+    toggle("เปิดห้องให้เพื่อนเข้าอัตโนมัติเมื่อเริ่มเกม", "auto_room", true)
 
     box.addView(label("สตรีม: เฟรมเรต (ลดลงถ้าเครื่องหน่วงตอนสตรีม)"))
     val fpsOptions = listOf(15, 24, 30)
@@ -499,7 +500,25 @@ fun showSettingsDialog(a: AppCompatActivity) {
     }
     box.addView(group)
 
-    box.addView(label("การตั้งค่าปุ่มบนจอและสตรีมมีผลตอนเริ่มเกม/เริ่มสตรีมครั้งถัดไป"))
+    box.addView(label("ผู้เล่นหลายคน (Multitap): ถ้าเพื่อนคนที่ 3–4 ขยับไม่ได้ ให้เลือก \"เปิด\""))
+    val mtValues = listOf("auto", "enabled", "disabled")
+    val mtLabels = listOf("อัตโนมัติ", "เปิด (3–4 คน)", "ปิด (2 คน)")
+    val mtGroup = RadioGroup(a)
+    mtGroup.orientation = RadioGroup.VERTICAL
+    mtValues.forEachIndexed { i, value ->
+        val rb = RadioButton(a)
+        rb.id = 2000 + i
+        rb.text = mtLabels[i]
+        rb.isChecked = (prefs.getString("multitap", "auto") ?: "auto") == value
+        mtGroup.addView(rb)
+    }
+    mtGroup.setOnCheckedChangeListener { _, checkedId ->
+        val idx = checkedId - 2000
+        if (idx in mtValues.indices) prefs.edit().putString("multitap", mtValues[idx]).apply()
+    }
+    box.addView(mtGroup)
+
+    box.addView(label("การตั้งค่าปุ่มบนจอ สตรีม และ Multitap มีผลตอนเริ่มเกมครั้งถัดไป"))
 
     AlertDialog.Builder(a)
         .setTitle("ตั้งค่า")

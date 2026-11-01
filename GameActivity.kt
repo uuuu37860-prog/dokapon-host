@@ -43,6 +43,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.swordfish.libretrodroid.GLRetroView
 import com.swordfish.libretrodroid.GLRetroViewData
+import com.swordfish.libretrodroid.Variable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -566,6 +567,13 @@ class GameActivity : AppCompatActivity() {
                 if (sram.exists()) saveRAMState = sram.readBytes()
                 systemDirectory = File(filesDir, "system").apply { mkdirs() }.absolutePath
                 savesDirectory = File(filesDir, "saves").apply { mkdirs() }.absolutePath
+                val mt = settings.getString("multitap", "auto") ?: "auto"
+                val oldMt = if (mt == "enabled") "port 1 only" else "disabled"
+                variables = arrayOf(
+                    Variable("pcsx_rearmed_multitap1", mt),
+                    Variable("pcsx_rearmed_multitap2", "disabled"),
+                    Variable("pcsx_rearmed_multitap", oldMt)
+                )
             }
             val view = GLRetroView(this, data)
             lifecycle.addObserver(view)
@@ -582,6 +590,11 @@ class GameActivity : AppCompatActivity() {
         setContentView(root)
 
         ui.postDelayed(autosave, 60000)
+        if (settings.getBoolean("auto_room", true)) {
+            ui.postDelayed({
+                if (streamer == null && !isFinishing) startStreaming()
+            }, 1500)
+        }
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 exitGame()
