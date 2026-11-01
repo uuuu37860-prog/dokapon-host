@@ -20,11 +20,16 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -205,6 +210,22 @@ class MainActivity : AppCompatActivity() {
             coverText,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                 .apply { gravity = Gravity.BOTTOM or Gravity.START }
+        )
+        cover.addView(
+            TextView(this).apply {
+                text = "⚙"
+                textSize = 20f
+                setTextColor(Color.WHITE)
+                setPadding(dp(14), dp(6), dp(14), dp(6))
+                background = rounded(Color.argb(120, 0, 0, 0), 18)
+                setOnClickListener { showSettingsDialog(this@MainActivity) }
+            },
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply {
+                    gravity = Gravity.TOP or Gravity.END
+                    topMargin = dp(10)
+                    rightMargin = dp(10)
+                }
         )
         root.addView(cover)
 
@@ -411,6 +432,82 @@ class MainActivity : AppCompatActivity() {
         startActivity(Intent(this, GameActivity::class.java).putExtra("game", game.absolutePath))
     }
 }
+
+/** หน้าตั้งค่า (ใช้ทั้งหน้าแรกและในเกม) ค่าเก็บใน SharedPreferences "dokapon" */
+fun showSettingsDialog(a: AppCompatActivity) {
+    val prefs = a.getSharedPreferences("dokapon", Context.MODE_PRIVATE)
+    val density = a.resources.displayMetrics.density
+    fun dp(v: Int) = (v * density).toInt()
+
+    val box = LinearLayout(a).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(20), dp(8), dp(20), dp(8))
+    }
+
+    fun label(t: String): TextView = TextView(a).apply {
+        text = t
+        textSize = 14f
+        setPadding(0, dp(14), 0, dp(4))
+    }
+
+    fun seek(title: String, key: String, lo: Int, hi: Int, def: Int, unit: String) {
+        val tv = label("$title: ${prefs.getInt(key, def)}$unit")
+        val bar = SeekBar(a)
+        bar.max = hi - lo
+        bar.progress = prefs.getInt(key, def) - lo
+        bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                tv.text = "$title: ${p + lo}$unit"
+                prefs.edit().putInt(key, p + lo).apply()
+            }
+
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+        box.addView(tv)
+        box.addView(bar)
+    }
+
+    fun toggle(title: String, key: String, def: Boolean) {
+        val sw = SwitchCompat(a)
+        sw.text = title
+        sw.isChecked = prefs.getBoolean(key, def)
+        sw.setPadding(0, dp(10), 0, dp(10))
+        sw.setOnCheckedChangeListener { _, checked -> prefs.edit().putBoolean(key, checked).apply() }
+        box.addView(sw)
+    }
+
+    seek("ความเข้มของปุ่มบนจอ", "ui_alpha", 20, 100, 55, "%")
+    seek("ขนาดปุ่มบนจอ", "ui_scale", 70, 140, 100, "%")
+    toggle("สลับปุ่ม ✕ กับ ○ (ปุ่มบนจอของคุณ)", "swap_ab", false)
+    toggle("โหมดประสิทธิภาพคงที่ (ช่วยลดอาการกระตุกเมื่อเครื่องร้อน)", "sustained", true)
+
+    box.addView(label("สตรีม: เฟรมเรต (ลดลงถ้าเครื่องหน่วงตอนสตรีม)"))
+    val fpsOptions = listOf(15, 24, 30)
+    val group = RadioGroup(a)
+    group.orientation = RadioGroup.HORIZONTAL
+    fpsOptions.forEachIndexed { i, f ->
+        val rb = RadioButton(a)
+        rb.id = 1000 + i
+        rb.text = "$f fps"
+        rb.isChecked = prefs.getInt("stream_fps", 24) == f
+        group.addView(rb)
+    }
+    group.setOnCheckedChangeListener { _, checkedId ->
+        val idx = checkedId - 1000
+        if (idx in fpsOptions.indices) prefs.edit().putInt("stream_fps", fpsOptions[idx]).apply()
+    }
+    box.addView(group)
+
+    box.addView(label("การตั้งค่าปุ่มบนจอและสตรีมมีผลตอนเริ่มเกม/เริ่มสตรีมครั้งถัดไป"))
+
+    AlertDialog.Builder(a)
+        .setTitle("ตั้งค่า")
+        .setView(ScrollView(a).apply { addView(box) })
+        .setPositiveButton("ปิด", null)
+        .show()
+}
+
 
 /** โหมดผู้เล่น: เปิดหน้าเล่นที่ฝังไว้ในแอปผ่าน WebView (ไม่ต้องพึ่งเว็บภายนอก) */
 class PlayerActivity : AppCompatActivity() {
