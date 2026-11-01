@@ -128,6 +128,21 @@ class StreamService : Service() {
     }
 }
 
+/** บันทึกเหตุการณ์การเชื่อมต่อ (ไว้ถ่ายภาพส่งมาแก้ปัญหา) */
+object DebugLog {
+    private val lines = ArrayList<String>()
+
+    @Synchronized
+    fun add(text: String) {
+        val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+        lines.add("$t $text")
+        while (lines.size > 60) lines.removeAt(0)
+    }
+
+    @Synchronized
+    fun tail(n: Int): String = lines.takeLast(n).joinToString("\n")
+}
+
 /** ติดต่อเซิร์ฟเวอร์จับคู่ฟรีของ PeerJS แบบดิบ ๆ ผ่าน WebSocket (ใช้เป็นแค่ตัวส่งต่อข้อความ) */
 class Signaling(private val id: String, private val listener: Listener) {
     interface Listener {
@@ -150,11 +165,13 @@ class Signaling(private val id: String, private val listener: Listener) {
     fun connect() {
         closed = false
         val gen = ++generation
+        DebugLog.add("[ws ${id.takeLast(6)}] กำลังเชื่อมต่อเซิร์ฟเวอร์จับคู่")
         val chars = "abcdefghijklmnopqrstuvwxyz0123456789"
         val token = (1..12).map { chars[(Math.random() * chars.length).toInt()] }.joinToString("")
         val req = Request.Builder().url("wss://0.peerjs.com/peerjs?key=peerjs&id=$id&token=$token").build()
         ws = client.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                DebugLog.add("[ws ${id.takeLast(6)}] เปิดการเชื่อมต่อแล้ว (HTTP ${response.code})")
                 main.post {
                     if (gen != generation) return@post
                     main.removeCallbacks(heartbeat)
@@ -168,6 +185,9 @@ class Signaling(private val id: String, private val listener: Listener) {
                     val type = j.optString("type")
                     val src = if (j.has("src")) j.optString("src") else null
                     val payload = j.optJSONObject("payload")
+                    if (type != "HEARTBEAT") {
+                        DebugLog.add("[ws ${id.takeLast(6)}] รับ $type จาก ${src?.takeLast(6) ?: "-"} t=${payload?.optString("t") ?: "-"}")
+                    }
                     main.post { if (gen == generation) listener.onMessage(type, src, payload) }
                 } catch (e: Exception) {
                     // ข้อความที่อ่านไม่ได้ ข้ามไป
@@ -175,16 +195,20 @@ class Signaling(private val id: String, private val listener: Listener) {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                main.post { if (gen == generation && !closed) listener.onMessage("CLOSED", null, null) }
+                val msg = (t.message ?: t.toString()).take(80)
+                DebugLog.add("[ws ${id.takeLast(6)}] ล้มเหลว: $msg http=${response?.code}")
+                main.post { if (gen == generation && !closed) listener.onMessage("CLOSED", null, JSONObject().put("msg", msg)) }
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                main.post { if (gen == generation && !closed) listener.onMessage("CLOSED", null, null) }
+                DebugLog.add("[ws ${id.takeLast(6)}] ปิด code=$code $reason")
+                main.post { if (gen == generation && !closed) listener.onMessage("CLOSED", null, JSONObject().put("msg", "ปิด $code")) }
             }
         })
     }
 
     fun send(type: String, dst: String, payload: JSONObject) {
+        DebugLog.add("[ws ${id.takeLast(6)}] ส่ง $type ถึง ${dst.takeLast(6)} t=${payload.optString("t")}")
         ws?.send(JSONObject().put("type", type).put("dst", dst).put("payload", payload).toString())
     }
 
@@ -381,7 +405,13 @@ class Streamer(
     }
 
     private fun join(src: String, name: String) {
-        if (peers.containsKey(src)) drop(src)
+        val existing = peers[src]
+        if (existing != null) {
+            // เพื่อนส่งคำขอซ้ำ (ยังไม่ได้รับคำตอบ) ตอบซ้ำโดยไม่สร้างการเชื่อมต่อใหม่
+            sig?.send("ANSWER", src, JSONObject().put("t", "joined").put("slot", existing.slot).put("name", existing.name))
+            return
+        }
+        DebugLog.add("[host] เพื่อนขอเข้าห้อง: $name")
         val used = peers.values.map { it.slot }.toSet()
         val slot = listOf(1, 2, 3).firstOrNull { it !in used }
         if (slot == null) {
@@ -407,6 +437,7 @@ class Streamer(
         val pc = factory.createPeerConnection(config, object : PeerConnection.Observer {
             override fun onSignalingChange(s: PeerConnection.SignalingState?) {}
             override fun onIceConnectionChange(s: PeerConnection.IceConnectionState?) {
+                DebugLog.add("[host] ICE ${peer.name}: $s")
                 main.post {
                     if (peers[peer.id] !== peer) return@post
                     when (s) {
@@ -695,6 +726,7 @@ class GameActivity : AppCompatActivity() {
             "💳 บันทึกเมมการ์ดตอนนี้",
             if (v.audioEnabled) "🔇 ปิดเสียงเกม" else "🔊 เปิดเสียงเกม",
             "🔄 รีเซ็ตเกม",
+            "📋 บันทึกการเชื่อมต่อ",
             "⚙ ตั้งค่า",
             "❌ ออกจากเกม"
         )
@@ -707,8 +739,15 @@ class GameActivity : AppCompatActivity() {
                     6 -> { saveSram(true) }
                     7 -> { v.audioEnabled = !v.audioEnabled }
                     8 -> { v.reset() }
-                    9 -> { showSettingsDialog(this) }
-                    10 -> { exitGame() }
+                    9 -> {
+                        AlertDialog.Builder(this)
+                            .setTitle("บันทึกการเชื่อมต่อ")
+                            .setMessage(DebugLog.tail(30))
+                            .setPositiveButton("ปิด", null)
+                            .show()
+                    }
+                    10 -> { showSettingsDialog(this) }
+                    11 -> { exitGame() }
                 }
             }
             .show()
@@ -910,6 +949,25 @@ class PlayerActivity : AppCompatActivity() {
     private var padAlpha = 0.55f
     private var padScale = 1f
     private var swapLocal = false
+    private var joinAttempts = 0
+    private var joinName = ""
+
+    /** ส่งคำขอเข้าห้องซ้ำทุก 3 วินาที (สูงสุด 8 ครั้ง) จนกว่าโฮสต์จะตอบ */
+    private val joinRetry = object : Runnable {
+        override fun run() {
+            if (finished || joined) return
+            if (joinAttempts < 8) {
+                joinAttempts++
+                sig?.send("OFFER", hostId, JSONObject().put("t", "join").put("name", joinName))
+                main.postDelayed(this, 3000)
+            }
+        }
+    }
+
+    private fun show(msg: String) {
+        statusView.text = msg + "\n\n" + DebugLog.tail(6)
+        statusView.visibility = View.VISIBLE
+    }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -943,7 +1001,7 @@ class PlayerActivity : AppCompatActivity() {
 
         statusView = TextView(this).apply {
             text = "กำลังเชื่อมต่อห้อง $room…"
-            textSize = 16f
+            textSize = 13f
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
             setPadding(dp(24), dp(12), dp(24), dp(12))
@@ -982,7 +1040,20 @@ class PlayerActivity : AppCompatActivity() {
             override fun onMessage(type: String, src: String?, payload: JSONObject?) {
                 if (finished) return
                 when (type) {
-                    "OPEN" -> sig?.send("OFFER", hostId, JSONObject().put("t", "join").put("name", name))
+                    "OPEN" -> {
+                        show("เชื่อมต่อเซิร์ฟเวอร์จับคู่แล้ว กำลังขอเข้าห้อง…")
+                        joinAttempts = 0
+                        main.removeCallbacks(joinRetry)
+                        joinName = name
+                        main.post(joinRetry)
+                    }
+                    "CLOSED" -> {
+                        val m = payload?.optString("msg") ?: ""
+                        if (!joined) {
+                            show("เชื่อมต่อเซิร์ฟเวอร์จับคู่ไม่ได้ ($m) กำลังลองใหม่…")
+                            main.postDelayed({ if (!finished && !joined) sig?.reconnect() }, 2500)
+                        }
+                    }
                     "ID-TAKEN" -> fail("เชื่อมต่อชนกัน ลองเข้าห้องใหม่อีกครั้ง")
                     "EXPIRE" -> if (!joined) fail("ไม่พบห้องนี้ ตรวจรหัสห้อง และรอให้โฮสต์เริ่มเกมก่อน")
                     "ERROR" -> fail("เซิร์ฟเวอร์จับคู่แจ้งข้อผิดพลาด")
@@ -1008,11 +1079,12 @@ class PlayerActivity : AppCompatActivity() {
                 }
             }
         })
+        DebugLog.add("[player] เข้าห้อง $room (host id $hostId)")
         sig?.connect()
 
         main.postDelayed({
             if (!joined && !finished) fail("เข้าห้องไม่สำเร็จ ตรวจรหัสห้อง และตรวจว่าโฮสต์เริ่มเกมแล้ว")
-        }, 20000)
+        }, 30000)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -1025,10 +1097,11 @@ class PlayerActivity : AppCompatActivity() {
         joined = true
         badge.text = "ผู้เล่น ${slot + 1}"
         badge.visibility = View.VISIBLE
-        statusView.text = "กำลังรอภาพจากโฮสต์…"
+        show("โฮสต์ตอบรับแล้ว กำลังรอภาพ…")
     }
 
     private fun onOffer(sdp: String) {
+        DebugLog.add("[player] ได้รับ OFFER จากโฮสต์")
         val f = factory ?: return
         pc?.close()
         remoteSet = false
@@ -1043,6 +1116,7 @@ class PlayerActivity : AppCompatActivity() {
         val c = f.createPeerConnection(config, object : PeerConnection.Observer {
             override fun onSignalingChange(s: PeerConnection.SignalingState?) {}
             override fun onIceConnectionChange(s: PeerConnection.IceConnectionState?) {
+                DebugLog.add("[player] ICE: $s")
                 main.post {
                     when (s) {
                         PeerConnection.IceConnectionState.FAILED -> fail("เชื่อมต่อภาพไม่สำเร็จ ลองสลับ Wi-Fi/เน็ตมือถือ")
@@ -1105,7 +1179,7 @@ class PlayerActivity : AppCompatActivity() {
 
     private fun fail(msg: String) {
         if (finished) return
-        statusView.text = "$msg (แตะเพื่อออก)"
+        statusView.text = "$msg (แตะเพื่อออก)\n\n" + DebugLog.tail(10)
         statusView.visibility = View.VISIBLE
         statusView.setOnClickListener { leave() }
     }
