@@ -359,7 +359,7 @@ class Signaling(
     }
 }
 
-data class LobbyRoom(val room: String, val name: String, val players: Int)
+data class LobbyRoom(val room: String, val name: String, val players: Int, val max: Int)
 
 /** ดูรายชื่อห้องที่เปิดอยู่ (ล็อบบี้) จากเซิร์ฟเวอร์ MQTT */
 class LobbyWatcher(private val ctx: Context, private val onChange: (List<LobbyRoom>) -> Unit) {
@@ -390,7 +390,7 @@ class LobbyWatcher(private val ctx: Context, private val onChange: (List<LobbyRo
                     try {
                         val j = JSONObject(String(message.payload))
                         if (j.optBoolean("online") && j.optBoolean("public", true)) {
-                            rooms[room] = LobbyRoom(room, j.optString("name", "โฮสต์"), j.optInt("players", 1))
+                            rooms[room] = LobbyRoom(room, j.optString("name", "โฮสต์"), j.optInt("players", 1), j.optInt("max", 4))
                         } else {
                             rooms.remove(room)
                         }
@@ -443,15 +443,14 @@ class Streamer(
     private val room: String,
     private val fps: Int,
     private val autoAccept: Boolean,
+    private val quality: Int,
+    private val poolSize: Int,
+    val hostSlot: Int,
+    private val randomSeat: Boolean,
     private val onJoinRequest: (src: String, name: String, decide: (Boolean) -> Unit) -> Unit,
     private val onInput: (slot: Int, btn: Int, down: Boolean) -> Unit,
     private val onStatus: (String) -> Unit
 ) {
-    companion object {
-        const val FRAME_W = 320
-        const val FRAME_H = 240
-    }
-
     private class Peer(val id: String, val slot: Int, val name: String) {
         var pc: PeerConnection? = null
         var channel: DataChannel? = null
@@ -464,8 +463,10 @@ class Streamer(
     private var track: VideoTrack? = null
     private var grabThread: HandlerThread? = null
     private var grabHandler: Handler? = null
-    private val frameBitmap: Bitmap = Bitmap.createBitmap(FRAME_W, FRAME_H, Bitmap.Config.ARGB_8888)
-    private val framePixels = IntArray(FRAME_W * FRAME_H)
+    private val frameW: Int = when (quality) { 0 -> 320; 2 -> 640; else -> 480 }
+    private val frameH: Int = frameW * 3 / 4
+    private val frameBitmap: Bitmap = Bitmap.createBitmap(frameW, frameH, Bitmap.Config.ARGB_8888)
+    private val framePixels = IntArray(frameW * frameH)
     @Volatile private var grabbing = false
     private var sig: Signaling? = null
     private val peers = HashMap<String, Peer>()
@@ -493,15 +494,35 @@ class Streamer(
         }
     }
 
+    private var loggedGrabSize = false
+
     private fun grabOnce() {
         if (grabbing || peers.isEmpty()) return
-        if (!surface.holder.surface.isValid || surface.width == 0 || surface.height == 0) return
-        val h = surface.height
-        val w = minOf(surface.width, h * 4 / 3)
-        val left = (surface.width - w) / 2
+        if (!surface.holder.surface.isValid) return
+        // PixelCopy ใช้พิกัดของ "พื้นผิวภาพ" (surface) ซึ่งอาจต่างจากขนาดของ View
+        val f = surface.holder.surfaceFrame
+        val fw = f.width()
+        val fh = f.height()
+        if (fw <= 0 || fh <= 0) return
+        // กรอบ 4:3 ที่พอดีอยู่ในพื้นผิว (ตรงกับพื้นที่ที่เกมวาดจริง)
+        val rw: Int
+        val rh: Int
+        if (fw * 3 > fh * 4) {
+            rh = fh
+            rw = fh * 4 / 3
+        } else {
+            rw = fw
+            rh = fw * 3 / 4
+        }
+        val left = (fw - rw) / 2
+        val top = (fh - rh) / 2
+        if (!loggedGrabSize) {
+            loggedGrabSize = true
+            DebugLog.add("[host] จับภาพจากพื้นผิว ${fw}x$fh (view ${surface.width}x${surface.height}) ใช้กรอบ ${rw}x$rh")
+        }
         grabbing = true
         try {
-            PixelCopy.request(surface, Rect(left, 0, left + w, h), frameBitmap, { result ->
+            PixelCopy.request(surface, Rect(left, top, left + rw, top + rh), frameBitmap, { result ->
                 try {
                     if (result == PixelCopy.SUCCESS) pushFrame()
                 } finally {
@@ -516,8 +537,8 @@ class Streamer(
     /** แปลงภาพ ARGB ขนาด 320x240 เป็น I420 แล้วส่งให้ WebRTC */
     private fun pushFrame() {
         val src = source ?: return
-        val w = FRAME_W
-        val h = FRAME_H
+        val w = frameW
+        val h = frameH
         frameBitmap.getPixels(framePixels, 0, w, 0, 0, w, h)
         val buf = JavaI420Buffer.allocate(w, h)
         val yP = buf.dataY
@@ -548,7 +569,7 @@ class Streamer(
     }
 
     fun start() {
-        val src = factory.createVideoSource(false)
+        val src = factory.createVideoSource(true)
         src.capturerObserver.onCapturerStarted(true)
         source = src
         track = factory.createVideoTrack("game", src)
@@ -574,12 +595,13 @@ class Streamer(
         return JSONObject()
             .put("name", name)
             .put("players", peers.size + 1)
+            .put("max", poolSize)
             .put("public", p.getBoolean("public_room", true))
             .toString()
     }
 
     private fun status(extra: String? = null) {
-        onStatus(extra ?: "ห้อง $room · เพื่อน ${peers.size} คน")
+        onStatus(extra ?: "ห้อง $room · คุณคือผู้เล่น ${hostSlot + 1} · เพื่อน ${peers.size} คน")
     }
 
     private fun onSignal(type: String, src: String?, p: JSONObject?) {
@@ -647,7 +669,8 @@ class Streamer(
 
     private fun admit(src: String, name: String) {
         val used = peers.values.map { it.slot }.toSet()
-        val slot = listOf(1, 2, 3).firstOrNull { it !in used }
+        val free = (0 until poolSize).filter { it != hostSlot && it !in used }
+        val slot = if (free.isEmpty()) null else if (randomSeat) free.random() else free.first()
         if (slot == null) {
             sig?.send("ANSWER", src, JSONObject().put("t", "full"))
             return
@@ -711,9 +734,11 @@ class Streamer(
             val sender = pc.addTrack(t, listOf("game"))
             try {
                 val params = sender.parameters
+                val maxBps = when (quality) { 0 -> 1_500_000; 2 -> 4_000_000; else -> 2_500_000 }
                 for (e in params.encodings) {
-                    e.maxBitrateBps = 2_000_000
-                    e.maxFramerate = 30
+                    e.maxBitrateBps = maxBps
+                    e.minBitrateBps = maxBps / 3
+                    e.maxFramerate = fps
                 }
                 sender.setParameters(params)
             } catch (e: Exception) {
@@ -788,6 +813,7 @@ class GameActivity : AppCompatActivity() {
 
     private var gameKey = "game"
     private var lastSramHash = 0
+    private var hostPort = 0
     private var padAlpha = 0.55f
     private var padScale = 1f
     private var swapLocal = false
@@ -997,7 +1023,7 @@ class GameActivity : AppCompatActivity() {
     }
 
     private fun press(code: Int, down: Boolean) {
-        retroView?.sendKeyEvent(if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP, code, 0)
+        retroView?.sendKeyEvent(if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP, code, hostPort)
     }
 
     // ---------- สตรีม ----------
@@ -1060,11 +1086,17 @@ class GameActivity : AppCompatActivity() {
         streamBtn.visibility = View.GONE
         statusView.text = "กำลังเริ่มสตรีม…"
         val room = getSharedPreferences("dokapon", MODE_PRIVATE).getString("room", "DOKAPN") ?: "DOKAPN"
-        val fps = getSharedPreferences("dokapon", MODE_PRIVATE).getInt("stream_fps", 24)
+        val prefs = getSharedPreferences("dokapon", MODE_PRIVATE)
+        val fps = prefs.getInt("stream_fps", 30)
+        val pool = if ((prefs.getString("multitap", "auto") ?: "auto") == "enabled") 4 else 2
+        // เกมสุ่มลำดับตาเดินเอง จึงไม่สุ่มช่องจอยซ้ำ: โฮสต์ = ผู้เล่น 1 เพื่อนเรียงตามลำดับที่เข้าห้อง
+        val randomSeat = false
+        hostPort = if (randomSeat) (0 until pool).random() else 0
         try {
             val s = Streamer(
                 this, view, room, fps,
-                getSharedPreferences("dokapon", MODE_PRIVATE).getBoolean("auto_accept", false),
+                prefs.getBoolean("auto_accept", false),
+                prefs.getInt("stream_q", 1), pool, hostPort, randomSeat,
                 { _, name, decide -> runOnUiThread { askJoin(name, decide) } },
                 { slot, btn, down ->
                     val code = PadMap.code(btn)
@@ -1416,6 +1448,14 @@ class PlayerActivity : AppCompatActivity() {
             }
             override fun onRenegotiationNeeded() {}
             override fun onAddTrack(r: RtpReceiver?, s: Array<out MediaStream>?) {
+                if (r != null) {
+                    try {
+                        val m = r.javaClass.getMethod("setJitterBufferMinimumDelay", java.lang.Double::class.java)
+                        m.invoke(r, 0.0)
+                    } catch (e: Throwable) {
+                        // ไลบรารีเวอร์ชันนี้ไม่มีตัวเลือกนี้ ข้ามไป
+                    }
+                }
                 val t = r?.track()
                 if (t is VideoTrack) {
                     main.post {
