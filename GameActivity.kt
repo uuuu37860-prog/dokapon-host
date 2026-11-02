@@ -447,11 +447,11 @@ class Streamer(
     private val poolSize: Int,
     val hostSlot: Int,
     private val randomSeat: Boolean,
-    private val onJoinRequest: (src: String, name: String, decide: (Boolean) -> Unit) -> Unit,
+    private val onJoinRequest: (src: String, name: String, decide: (Boolean, Int) -> Unit) -> Unit,
     private val onInput: (slot: Int, btn: Int, down: Boolean) -> Unit,
     private val onStatus: (String) -> Unit
 ) {
-    private class Peer(val id: String, val slot: Int, val name: String) {
+    private class Peer(val id: String, var slot: Int, val name: String) {
         var pc: PeerConnection? = null
         var channel: DataChannel? = null
     }
@@ -652,25 +652,26 @@ class Streamer(
             return
         }
         if (autoAccept) {
-            admit(src, name)
+            admit(src, name, -1)
             return
         }
         pendingJoin[src] = name
         sig?.send("ANSWER", src, JSONObject().put("t", "wait"))
-        onJoinRequest(src, name) { ok ->
+        onJoinRequest(src, name) { ok, seat ->
             main.post {
                 pendingJoin.remove(src)
                 if (!stopped) {
-                    if (ok) admit(src, name) else sig?.send("ANSWER", src, JSONObject().put("t", "denied"))
+                    if (ok) admit(src, name, seat) else sig?.send("ANSWER", src, JSONObject().put("t", "denied"))
                 }
             }
         }
     }
 
-    private fun admit(src: String, name: String) {
+    private fun admit(src: String, name: String, seat: Int) {
         val used = peers.values.map { it.slot }.toSet()
         val free = (0 until poolSize).filter { it != hostSlot && it !in used }
-        val slot = if (free.isEmpty()) null else if (randomSeat) free.random() else free.first()
+        // เจ้าของห้องเลือกช่องเองได้ (seat >= 0) ถ้าไม่เลือกจะเรียงตามลำดับที่ว่างก่อน
+        val slot = if (free.isEmpty()) null else if (seat in free) seat else free.first()
         if (slot == null) {
             sig?.send("ANSWER", src, JSONObject().put("t", "full"))
             return
@@ -786,6 +787,52 @@ class Streamer(
         try { p.channel?.close() } catch (e: Exception) { }
         try { p.pc?.close() } catch (e: Exception) { }
         sig?.refreshPresence()
+        status()
+    }
+
+    // ---------- จัดลำดับผู้เล่นโดยเจ้าของห้อง ----------
+    /** รายชื่อเพื่อนในห้อง: (id, ชื่อ, ช่องปัจจุบัน) */
+    fun friendList(): List<Triple<String, String, Int>> =
+        peers.values.sortedBy { it.slot }.map { Triple(it.id, it.name, it.slot) }
+
+    fun freeSeats(): List<Int> =
+        (0 until poolSize).filter { it != hostSlot && peers.values.none { p -> p.slot == it } }
+
+    /** ช่องที่ย้ายเพื่อนคนนี้ไปได้ พร้อมป้ายบอกว่าว่างหรือสลับกับใคร */
+    fun seatOptions(movingId: String): List<Pair<Int, String>> {
+        val res = ArrayList<Pair<Int, String>>()
+        for (seat in 0 until poolSize) {
+            if (seat == hostSlot) continue
+            val occ = peers.values.firstOrNull { it.slot == seat }
+            if (occ != null && occ.id == movingId) continue
+            res.add(seat to ("ผู้เล่น ${seat + 1} " + if (occ == null) "(ว่าง)" else "(สลับกับ ${occ.name})"))
+        }
+        return res
+    }
+
+    private fun releaseSlot(slot: Int) {
+        held[slot]?.toList()?.forEach { dispatchInput(slot, it, false) }
+    }
+
+    private fun notifySlot(p: Peer) {
+        sig?.send("ANSWER", p.id, JSONObject().put("t", "slot").put("slot", p.slot).put("name", p.name))
+    }
+
+    /** ย้ายเพื่อนไปช่องใหม่ ถ้าช่องนั้นมีคนอยู่แล้วจะสลับกัน */
+    fun moveFriend(id: String, newSlot: Int) {
+        val p = peers[id] ?: return
+        if (newSlot == p.slot || newSlot == hostSlot || newSlot !in 0 until poolSize) return
+        val other = peers.values.firstOrNull { it.slot == newSlot && it.id != id }
+        val old = p.slot
+        releaseSlot(old)
+        releaseSlot(newSlot)
+        p.slot = newSlot
+        if (other != null) {
+            other.slot = old
+            notifySlot(other)
+        }
+        notifySlot(p)
+        DebugLog.add("[host] ย้าย ${p.name} ไปผู้เล่น ${newSlot + 1}")
         status()
     }
 
@@ -988,6 +1035,7 @@ class GameActivity : AppCompatActivity() {
             "💳 บันทึกเมมการ์ดตอนนี้",
             if (v.audioEnabled) "🔇 ปิดเสียงเกม" else "🔊 เปิดเสียงเกม",
             "🔄 รีเซ็ตเกม",
+            "👥 จัดลำดับผู้เล่น",
             "📋 บันทึกการเชื่อมต่อ",
             "⚙ ตั้งค่า",
             "❌ ออกจากเกม"
@@ -1001,15 +1049,16 @@ class GameActivity : AppCompatActivity() {
                     6 -> { saveSram(true) }
                     7 -> { v.audioEnabled = !v.audioEnabled }
                     8 -> { v.reset() }
-                    9 -> {
+                    9 -> { showSeatDialog() }
+                    10 -> {
                         AlertDialog.Builder(this)
                             .setTitle("บันทึกการเชื่อมต่อ")
                             .setMessage(DebugLog.tail(30))
                             .setPositiveButton("ปิด", null)
                             .show()
                     }
-                    10 -> { showSettingsDialog(this) }
-                    11 -> { exitGame() }
+                    11 -> { showSettingsDialog(this) }
+                    12 -> { exitGame() }
                 }
             }
             .show()
@@ -1063,17 +1112,66 @@ class GameActivity : AppCompatActivity() {
         })
     }
 
-    private fun askJoin(name: String, decide: (Boolean) -> Unit) {
+    private fun askJoin(name: String, decide: (Boolean, Int) -> Unit) {
         if (isFinishing) {
-            decide(false)
+            decide(false, -1)
             return
         }
         AlertDialog.Builder(this)
             .setTitle("เพื่อนขอเข้าห้อง")
             .setMessage("\"$name\" ขอเข้าห้องเพื่อเล่นด้วย ให้เข้าไหม?")
             .setCancelable(false)
-            .setPositiveButton("✅ ยอมรับ") { _, _ -> decide(true) }
-            .setNegativeButton("❌ ปฏิเสธ") { _, _ -> decide(false) }
+            .setPositiveButton("✅ ยอมรับ") { _, _ -> decide(true, -1) }
+            .setNeutralButton("🎯 เลือกช่อง") { _, _ -> askSeatForNew(name, decide) }
+            .setNegativeButton("❌ ปฏิเสธ") { _, _ -> decide(false, -1) }
+            .show()
+    }
+
+    private fun askSeatForNew(name: String, decide: (Boolean, Int) -> Unit) {
+        val seats = streamer?.freeSeats() ?: emptyList()
+        if (seats.isEmpty()) {
+            decide(true, -1)
+            return
+        }
+        val labels = seats.map { "ผู้เล่น ${it + 1}" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("ให้ \"$name\" เป็นผู้เล่นคนที่")
+            .setItems(labels) { _, i -> decide(true, seats[i]) }
+            .setCancelable(false)
+            .show()
+    }
+
+    private fun showSeatDialog() {
+        val s = streamer
+        if (s == null) {
+            toast("ยังไม่ได้เปิดห้อง")
+            return
+        }
+        val friends = s.friendList()
+        if (friends.isEmpty()) {
+            toast("ยังไม่มีเพื่อนในห้อง")
+            return
+        }
+        val labels = friends.map { "${it.second} (ตอนนี้ผู้เล่น ${it.third + 1})" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("เลือกเพื่อนที่จะย้ายช่อง")
+            .setItems(labels) { _, i -> pickSeat(friends[i].first, friends[i].second) }
+            .setNegativeButton("ปิด", null)
+            .show()
+    }
+
+    private fun pickSeat(id: String, name: String) {
+        val s = streamer ?: return
+        val options = s.seatOptions(id)
+        if (options.isEmpty()) {
+            toast("ไม่มีช่องให้ย้าย (ต้องเปิด Multitap ถ้าจะใช้ผู้เล่น 3–4)")
+            return
+        }
+        val labels = options.map { it.second }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("ย้าย \"$name\" ไปเป็น")
+            .setItems(labels) { _, i -> s.moveFriend(id, options[i].first) }
+            .setNegativeButton("ปิด", null)
             .show()
     }
 
@@ -1282,7 +1380,24 @@ class PlayerActivity : AppCompatActivity() {
         r.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
         r.setEnableHardwareScaler(true)
         renderer = r
-        root.addView(r, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        root.addView(r, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER))
+        // SurfaceViewRenderer จะตัดภาพให้เต็มกรอบเมื่อกรอบเป็น MATCH_PARENT (ภาพจึงถูกซูม)
+        // จึงกำหนดกรอบเป็นสัดส่วน 4:3 ตรงกลางจอเอง ภาพจะไม่ถูกตัด
+        root.addOnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
+            val w = right - left
+            val h = bottom - top
+            if (w > 0 && h > 0) {
+                val vw = minOf(w, h * 4 / 3)
+                val vh = vw * 3 / 4
+                val lp = r.layoutParams as FrameLayout.LayoutParams
+                if (lp.width != vw || lp.height != vh) {
+                    lp.width = vw
+                    lp.height = vh
+                    lp.gravity = Gravity.CENTER
+                    r.layoutParams = lp
+                }
+            }
+        }
 
         statusView = TextView(this).apply {
             text = "กำลังเชื่อมต่อห้อง $room…"
@@ -1362,6 +1477,11 @@ class PlayerActivity : AppCompatActivity() {
                             else if (kind == "full") fail("ห้องเต็มแล้ว")
                             else if (kind == "wait") show("โฮสต์ได้รับคำขอแล้ว รอโฮสต์กดยอมรับ…")
                             else if (kind == "denied") fail("โฮสต์ไม่อนุญาตให้เข้าห้อง")
+                            else if (kind == "slot") {
+                                val n = payload.optInt("slot") + 1
+                                badge.text = "ผู้เล่น $n"
+                                Toast.makeText(this@PlayerActivity, "โฮสต์ย้ายคุณเป็นผู้เล่น $n", Toast.LENGTH_LONG).show()
+                            }
                         }
                     }
                     "OFFER" -> {
