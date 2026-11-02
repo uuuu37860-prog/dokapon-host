@@ -36,4 +36,5 @@ dependencies {
     implementation("com.github.swordfish90:libretrodroid:$libretroDroidVersion")
     implementation("io.getstream:stream-webrtc-android:1.3.9")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
 }

@@ -53,6 +53,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var playerSection: LinearLayout
     private lateinit var tabHost: TextView
     private lateinit var tabPlayer: TextView
+    private lateinit var joinCode: EditText
+    private lateinit var joinName: EditText
+    private lateinit var lobbyBox: LinearLayout
+    private var lobby: LobbyWatcher? = null
 
     private val pickGame =
         registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -290,11 +294,11 @@ class MainActivity : AppCompatActivity() {
         val joinCard = card()
         joinCard.addView(heading("เข้าห้องของเพื่อน"))
         joinCard.addView(note("ไม่ต้องมีไฟล์เกม แค่ใส่รหัสห้องที่เพื่อนให้มา"))
-        val joinCode = field("รหัสห้อง 6 ตัว").apply {
+        joinCode = field("รหัสห้อง 6 ตัว").apply {
             filters = arrayOf(InputFilter.AllCaps(), InputFilter.LengthFilter(6))
             setText(prefs().getString("pcode", "") ?: "")
         }
-        val joinName = field("ชื่อของคุณ").apply { setText(prefs().getString("pname", "") ?: "") }
+        joinName = field("ชื่อของคุณ").apply { setText(prefs().getString("pname", "") ?: "") }
         joinCard.addView(joinCode)
         joinCard.addView(joinName)
         joinCard.addView(button("เข้าห้องเป็นผู้เล่น", true) {
@@ -308,6 +312,13 @@ class MainActivity : AppCompatActivity() {
             }
         })
         playerSection.addView(joinCard)
+
+        val lobbyCard = card()
+        lobbyCard.addView(heading("ห้องที่เปิดอยู่"))
+        lobbyCard.addView(note("แตะห้องเพื่อขอเข้าเล่น (โฮสต์ต้องกดยอมรับ)"))
+        lobbyBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        lobbyCard.addView(lobbyBox)
+        playerSection.addView(lobbyCard)
         root.addView(playerSection)
 
         setContentView(ScrollView(this).apply {
@@ -317,6 +328,42 @@ class MainActivity : AppCompatActivity() {
         })
         selectTab(prefs().getBoolean("tab_host", true))
         refresh()
+    }
+
+    // ---------- ล็อบบี้ (รายชื่อห้องที่เปิดอยู่) ----------
+    override fun onResume() {
+        super.onResume()
+        startLobby()
+    }
+
+    override fun onPause() {
+        lobby?.stop()
+        lobby = null
+        super.onPause()
+    }
+
+    private fun startLobby() {
+        lobby?.stop()
+        lobbyBox.removeAllViews()
+        lobbyBox.addView(note("กำลังค้นหาห้อง…"))
+        val w = LobbyWatcher(this) { rooms -> renderLobby(rooms) }
+        lobby = w
+        w.start()
+    }
+
+    private fun renderLobby(rooms: List<LobbyRoom>) {
+        lobbyBox.removeAllViews()
+        if (rooms.isEmpty()) {
+            lobbyBox.addView(note("ยังไม่มีห้องที่เปิดอยู่ (ให้โฮสต์เริ่มเกมก่อน)"))
+            return
+        }
+        for (r in rooms) {
+            lobbyBox.addView(button("🎮 ${r.name} · ${r.players}/4 คน · รหัส ${r.room}", false) {
+                val nm = joinName.text.toString().trim().ifBlank { "ผู้เล่น" }
+                prefs().edit().putString("pname", nm).putString("pcode", r.room).apply()
+                startActivity(Intent(this, PlayerActivity::class.java).putExtra("room", r.room).putExtra("name", nm))
+            })
+        }
     }
 
     // ---------- แชร์ ----------
@@ -468,6 +515,7 @@ fun showSettingsDialog(a: AppCompatActivity) {
     toggle("สลับปุ่ม ✕ กับ ○ (ปุ่มบนจอของคุณ)", "swap_ab", false)
     toggle("โหมดประสิทธิภาพคงที่ (ช่วยลดอาการกระตุกเมื่อเครื่องร้อน)", "sustained", true)
     toggle("เปิดห้องให้เพื่อนเข้าอัตโนมัติเมื่อเริ่มเกม", "auto_room", true)
+    toggle("ยอมรับเพื่อนอัตโนมัติ (ไม่ต้องกดยอมรับทุกครั้ง)", "auto_accept", false)
 
     box.addView(label("สตรีม: เฟรมเรต (ลดลงถ้าเครื่องหน่วงตอนสตรีม)"))
     val fpsOptions = listOf(15, 24, 30)
@@ -504,7 +552,26 @@ fun showSettingsDialog(a: AppCompatActivity) {
     }
     box.addView(mtGroup)
 
-    box.addView(label("การตั้งค่าปุ่มบนจอ สตรีม และ Multitap มีผลตอนเริ่มเกมครั้งถัดไป"))
+    toggle("แสดงห้องของฉันในรายชื่อห้อง (คนในแอปเห็นและขอเข้าได้)", "public_room", true)
+
+    box.addView(label("เซิร์ฟเวอร์จับคู่ (โฮสต์กับเพื่อนต้องเลือกให้ตรงกัน)"))
+    val brokerLabels = listOf("EMQX (แนะนำ)", "HiveMQ", "Mosquitto")
+    val bGroup = RadioGroup(a)
+    bGroup.orientation = RadioGroup.VERTICAL
+    brokerLabels.forEachIndexed { i, l ->
+        val rb = RadioButton(a)
+        rb.id = 3000 + i
+        rb.text = l
+        rb.isChecked = prefs.getInt("broker", 0) == i
+        bGroup.addView(rb)
+    }
+    bGroup.setOnCheckedChangeListener { _, checkedId ->
+        val idx = checkedId - 3000
+        if (idx in brokerLabels.indices) prefs.edit().putInt("broker", idx).apply()
+    }
+    box.addView(bGroup)
+
+    box.addView(label("การตั้งค่าปุ่มบนจอ สตรีม Multitap และเซิร์ฟเวอร์ มีผลตอนเริ่มเกม/เข้าห้องครั้งถัดไป"))
 
     AlertDialog.Builder(a)
         .setTitle("ตั้งค่า")

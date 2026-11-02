@@ -53,6 +53,14 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.eclipse.paho.client.mqttv3.IMqttActionListener
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
+import org.eclipse.paho.client.mqttv3.IMqttToken
+import org.eclipse.paho.client.mqttv3.MqttAsyncClient
+import org.eclipse.paho.client.mqttv3.MqttCallbackExtended
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions
+import org.eclipse.paho.client.mqttv3.MqttMessage
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import org.json.JSONObject
 import org.webrtc.DataChannel
 import org.webrtc.DefaultVideoDecoderFactory
@@ -143,86 +151,278 @@ object DebugLog {
     fun tail(n: Int): String = lines.takeLast(n).joinToString("\n")
 }
 
-/** ติดต่อเซิร์ฟเวอร์จับคู่ฟรีของ PeerJS แบบดิบ ๆ ผ่าน WebSocket (ใช้เป็นแค่ตัวส่งต่อข้อความ) */
-class Signaling(private val id: String, private val listener: Listener) {
+/** เซิร์ฟเวอร์ MQTT สาธารณะที่ใช้เป็นตัวจับคู่/ล็อบบี้ (โฮสต์กับเพื่อนต้องใช้ตัวเดียวกัน) */
+object Brokers {
+    val urls = listOf(
+        "wss://broker.emqx.io:8084/mqtt",
+        "wss://broker.hivemq.com:8884/mqtt",
+        "wss://test.mosquitto.org:8081"
+    )
+
+    fun current(ctx: Context): Int {
+        return ctx.getSharedPreferences("dokapon", Context.MODE_PRIVATE).getInt("broker", 0).coerceIn(0, urls.size - 1)
+    }
+
+    fun url(ctx: Context): String = urls[current(ctx)]
+}
+
+private fun randomText(n: Int): String {
+    val chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+    val r = java.security.SecureRandom()
+    return (1..n).map { chars[r.nextInt(chars.length)] }.joinToString("")
+}
+
+/**
+ * ตัวจับคู่ผ่าน MQTT (เหมือนเกมออนไลน์ทั่วไปที่มีเซิร์ฟเวอร์กลาง)
+ * - หัวข้อ dokapon/v1/room/<ห้อง>  : สถานะห้อง (retained) โฮสต์ประกาศ ผู้เล่น/ล็อบบี้อ่าน
+ * - หัวข้อ dokapon/v1/box/<ห้อง>/<id> : กล่องรับข้อความของแต่ละเครื่อง
+ * ภาพและปุ่มยังวิ่งตรงระหว่างมือถือด้วย WebRTC ผ่านเซิร์ฟเวอร์นี้แค่ตอนจับคู่
+ */
+class Signaling(
+    private val ctx: Context,
+    private val id: String,
+    private val room: String,
+    private val isHost: Boolean,
+    private val hostInfo: () -> String,
+    private val listener: Listener
+) {
     interface Listener {
         fun onMessage(type: String, src: String?, payload: JSONObject?)
     }
 
-    private val client = OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).build()
     private val main = Handler(Looper.getMainLooper())
-    private var ws: WebSocket? = null
-    private var generation = 0
+    private var client: MqttAsyncClient? = null
     private var closed = false
+    private val roomTopic = "dokapon/v1/room/$room"
+    private fun inbox(target: String) = "dokapon/v1/box/$room/$target"
+    private val tag = id.takeLast(6)
 
-    private val heartbeat = object : Runnable {
+    private val refresh = object : Runnable {
         override fun run() {
-            ws?.send("{\"type\":\"HEARTBEAT\"}")
-            if (!closed) main.postDelayed(this, 5000)
+            if (closed) return
+            if (isHost) publishPresence(true)
+            main.postDelayed(this, 30000)
         }
     }
 
     fun connect() {
         closed = false
-        val gen = ++generation
-        DebugLog.add("[ws ${id.takeLast(6)}] กำลังเชื่อมต่อเซิร์ฟเวอร์จับคู่")
-        val chars = "abcdefghijklmnopqrstuvwxyz0123456789"
-        val token = (1..12).map { chars[(Math.random() * chars.length).toInt()] }.joinToString("")
-        val req = Request.Builder().url("wss://0.peerjs.com/peerjs?key=peerjs&id=$id&token=$token").build()
-        ws = client.newWebSocket(req, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                DebugLog.add("[ws ${id.takeLast(6)}] เปิดการเชื่อมต่อแล้ว (HTTP ${response.code})")
-                main.post {
-                    if (gen != generation) return@post
-                    main.removeCallbacks(heartbeat)
-                    main.post(heartbeat)
+        val url = Brokers.url(ctx)
+        DebugLog.add("[mqtt $tag] เชื่อมต่อ $url")
+        try {
+            val c = MqttAsyncClient(url, "dk-$tag-" + randomText(5), MemoryPersistence())
+            val opt = MqttConnectOptions()
+            opt.isCleanSession = true
+            opt.keepAliveInterval = 20
+            opt.connectionTimeout = 12
+            opt.isAutomaticReconnect = true
+            if (isHost) opt.setWill(roomTopic, "{\"online\":false}".toByteArray(), 1, true)
+            c.setCallback(object : MqttCallbackExtended {
+                override fun connectComplete(reconnect: Boolean, serverURI: String?) {
+                    DebugLog.add("[mqtt $tag] เชื่อมต่อสำเร็จ reconnect=$reconnect")
+                    subscribeAll(c)
                 }
-            }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                try {
-                    val j = JSONObject(text)
-                    val type = j.optString("type")
-                    val src = if (j.has("src")) j.optString("src") else null
-                    val payload = j.optJSONObject("payload")
-                    if (type != "HEARTBEAT") {
-                        DebugLog.add("[ws ${id.takeLast(6)}] รับ $type จาก ${src?.takeLast(6) ?: "-"} t=${payload?.optString("t") ?: "-"}")
+                override fun connectionLost(cause: Throwable?) {
+                    val m = (cause?.message ?: "หลุด").take(80)
+                    DebugLog.add("[mqtt $tag] หลุด: $m")
+                    main.post { if (!closed) listener.onMessage("CLOSED", null, JSONObject().put("msg", m)) }
+                }
+
+                override fun messageArrived(topic: String?, message: MqttMessage?) {
+                    if (topic != null && message != null) handle(topic, String(message.payload))
+                }
+
+                override fun deliveryComplete(token: IMqttDeliveryToken?) {}
+            })
+            client = c
+            c.connect(opt, null, object : IMqttActionListener {
+                override fun onSuccess(asyncActionToken: IMqttToken?) {}
+
+                override fun onFailure(asyncActionToken: IMqttToken?, exception: Throwable?) {
+                    val m = (exception?.message ?: "เชื่อมต่อไม่ได้").take(80)
+                    DebugLog.add("[mqtt $tag] เชื่อมต่อล้มเหลว: $m")
+                    main.post { if (!closed) listener.onMessage("CLOSED", null, JSONObject().put("msg", m)) }
+                }
+            })
+        } catch (e: Exception) {
+            val m = (e.message ?: e.toString()).take(80)
+            DebugLog.add("[mqtt $tag] สร้างการเชื่อมต่อไม่ได้: $m")
+            main.post { if (!closed) listener.onMessage("CLOSED", null, JSONObject().put("msg", m)) }
+        }
+    }
+
+    private fun subscribeAll(c: MqttAsyncClient) {
+        try {
+            c.subscribe(inbox(id), 1, null, object : IMqttActionListener {
+                override fun onSuccess(asyncActionToken: IMqttToken?) {
+                    DebugLog.add("[mqtt $tag] พร้อมรับข้อความ")
+                    main.post {
+                        if (closed) return@post
+                        listener.onMessage("OPEN", null, null)
+                        if (isHost) {
+                            publishPresence(true)
+                            main.removeCallbacks(refresh)
+                            main.postDelayed(refresh, 30000)
+                        }
                     }
-                    main.post { if (gen == generation) listener.onMessage(type, src, payload) }
-                } catch (e: Exception) {
-                    // ข้อความที่อ่านไม่ได้ ข้ามไป
                 }
-            }
 
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                val msg = (t.message ?: t.toString()).take(80)
-                DebugLog.add("[ws ${id.takeLast(6)}] ล้มเหลว: $msg http=${response?.code}")
-                main.post { if (gen == generation && !closed) listener.onMessage("CLOSED", null, JSONObject().put("msg", msg)) }
-            }
+                override fun onFailure(asyncActionToken: IMqttToken?, exception: Throwable?) {
+                    DebugLog.add("[mqtt $tag] subscribe ล้มเหลว: ${exception?.message}")
+                }
+            })
+            if (!isHost) c.subscribe(roomTopic, 1)
+        } catch (e: Exception) {
+            DebugLog.add("[mqtt $tag] subscribe error: ${e.message}")
+        }
+    }
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                DebugLog.add("[ws ${id.takeLast(6)}] ปิด code=$code $reason")
-                main.post { if (gen == generation && !closed) listener.onMessage("CLOSED", null, JSONObject().put("msg", "ปิด $code")) }
+    private fun handle(topic: String, text: String) {
+        try {
+            if (topic == roomTopic) {
+                val j = JSONObject(text)
+                DebugLog.add("[mqtt $tag] สถานะห้อง online=${j.optBoolean("online")}")
+                main.post { if (!closed) listener.onMessage("HOST", null, j) }
+                return
             }
-        })
+            val j = JSONObject(text)
+            val type = j.optString("type")
+            val src = j.optString("src")
+            val payload = j.optJSONObject("payload")
+            DebugLog.add("[mqtt $tag] รับ $type จาก ${src.takeLast(6)} t=${payload?.optString("t") ?: "-"}")
+            main.post { if (!closed) listener.onMessage(type, src, payload) }
+        } catch (e: Exception) {
+            DebugLog.add("[mqtt $tag] ข้อความอ่านไม่ได้")
+        }
+    }
+
+    private fun publishPresence(online: Boolean) {
+        if (!isHost) return
+        try {
+            val j = JSONObject(hostInfo()).put("online", online).put("ts", System.currentTimeMillis())
+            val m = MqttMessage(j.toString().toByteArray())
+            m.qos = 1
+            m.isRetained = true
+            client?.publish(roomTopic, m)
+        } catch (e: Exception) {
+            DebugLog.add("[mqtt $tag] ประกาศห้องไม่ได้: ${e.message}")
+        }
+    }
+
+    /** โฮสต์เรียกเมื่อจำนวนคนเปลี่ยน */
+    fun refreshPresence() {
+        publishPresence(true)
     }
 
     fun send(type: String, dst: String, payload: JSONObject) {
-        DebugLog.add("[ws ${id.takeLast(6)}] ส่ง $type ถึง ${dst.takeLast(6)} t=${payload.optString("t")}")
-        ws?.send(JSONObject().put("type", type).put("dst", dst).put("payload", payload).toString())
+        DebugLog.add("[mqtt $tag] ส่ง $type ถึง ${dst.takeLast(6)} t=${payload.optString("t")}")
+        try {
+            val text = JSONObject().put("type", type).put("src", id).put("payload", payload).toString()
+            val m = MqttMessage(text.toByteArray())
+            m.qos = 1
+            client?.publish(inbox(dst), m)
+        } catch (e: Exception) {
+            DebugLog.add("[mqtt $tag] ส่งไม่สำเร็จ: ${e.message}")
+        }
     }
 
     fun reconnect() {
-        generation++
-        try { ws?.cancel() } catch (e: Exception) { }
-        connect()
+        if (client?.isConnected == true) return
+        try {
+            client?.reconnect()
+        } catch (e: Exception) {
+            try { client?.close() } catch (e2: Exception) { }
+            client = null
+            connect()
+        }
     }
 
     fun close() {
         closed = true
-        generation++
-        main.removeCallbacks(heartbeat)
-        try { ws?.close(1000, null) } catch (e: Exception) { }
+        main.removeCallbacks(refresh)
+        val c = client
+        client = null
+        if (c == null) return
+        try {
+            if (isHost) {
+                val m = MqttMessage("{\"online\":false}".toByteArray())
+                m.qos = 1
+                m.isRetained = true
+                c.publish(roomTopic, m)
+            }
+        } catch (e: Exception) { }
+        main.postDelayed({
+            try { c.disconnect() } catch (e: Exception) { }
+            try { c.close() } catch (e: Exception) { }
+        }, 600)
+    }
+}
+
+data class LobbyRoom(val room: String, val name: String, val players: Int)
+
+/** ดูรายชื่อห้องที่เปิดอยู่ (ล็อบบี้) จากเซิร์ฟเวอร์ MQTT */
+class LobbyWatcher(private val ctx: Context, private val onChange: (List<LobbyRoom>) -> Unit) {
+    private val main = Handler(Looper.getMainLooper())
+    private var client: MqttAsyncClient? = null
+    private val rooms = LinkedHashMap<String, LobbyRoom>()
+    private var stopped = false
+
+    fun start() {
+        stopped = false
+        try {
+            val c = MqttAsyncClient(Brokers.url(ctx), "dk-lobby-" + randomText(6), MemoryPersistence())
+            val opt = MqttConnectOptions()
+            opt.isCleanSession = true
+            opt.keepAliveInterval = 20
+            opt.connectionTimeout = 12
+            opt.isAutomaticReconnect = true
+            c.setCallback(object : MqttCallbackExtended {
+                override fun connectComplete(reconnect: Boolean, serverURI: String?) {
+                    try { c.subscribe("dokapon/v1/room/+", 1) } catch (e: Exception) { }
+                }
+
+                override fun connectionLost(cause: Throwable?) {}
+
+                override fun messageArrived(topic: String?, message: MqttMessage?) {
+                    if (topic == null || message == null) return
+                    val room = topic.substringAfterLast('/')
+                    try {
+                        val j = JSONObject(String(message.payload))
+                        if (j.optBoolean("online") && j.optBoolean("public", true)) {
+                            rooms[room] = LobbyRoom(room, j.optString("name", "โฮสต์"), j.optInt("players", 1))
+                        } else {
+                            rooms.remove(room)
+                        }
+                    } catch (e: Exception) {
+                        rooms.remove(room)
+                    }
+                    val list = rooms.values.toList()
+                    main.post { if (!stopped) onChange(list) }
+                }
+
+                override fun deliveryComplete(token: IMqttDeliveryToken?) {}
+            })
+            client = c
+            c.connect(opt, null, object : IMqttActionListener {
+                override fun onSuccess(asyncActionToken: IMqttToken?) {}
+
+                override fun onFailure(asyncActionToken: IMqttToken?, exception: Throwable?) {
+                    DebugLog.add("[lobby] เชื่อมต่อไม่ได้: ${exception?.message}")
+                }
+            })
+        } catch (e: Exception) {
+            DebugLog.add("[lobby] error: ${e.message}")
+        }
+    }
+
+    fun stop() {
+        stopped = true
+        val c = client
+        client = null
+        if (c == null) return
+        try { c.disconnect() } catch (e: Exception) { }
+        try { c.close() } catch (e: Exception) { }
     }
 }
 
@@ -242,6 +442,8 @@ class Streamer(
     private val surface: SurfaceView,
     private val room: String,
     private val fps: Int,
+    private val autoAccept: Boolean,
+    private val onJoinRequest: (src: String, name: String, decide: (Boolean) -> Unit) -> Unit,
     private val onInput: (slot: Int, btn: Int, down: Boolean) -> Unit,
     private val onStatus: (String) -> Unit
 ) {
@@ -267,6 +469,7 @@ class Streamer(
     @Volatile private var grabbing = false
     private var sig: Signaling? = null
     private val peers = HashMap<String, Peer>()
+    private val pendingJoin = HashMap<String, String>()
     private val held = HashMap<Int, MutableSet<Int>>()
     private var stopped = false
     private val hostId = "dokapon-$room"
@@ -356,13 +559,23 @@ class Streamer(
         grabHandler = Handler(thread.looper)
         main.post(grabTask)
 
-        sig = Signaling(hostId, object : Signaling.Listener {
+        sig = Signaling(context, hostId, room, true, { hostInfoJson() }, object : Signaling.Listener {
             override fun onMessage(type: String, src: String?, payload: JSONObject?) {
                 onSignal(type, src, payload)
             }
         })
         sig?.connect()
         status("กำลังเชื่อมต่อห้อง…")
+    }
+
+    private fun hostInfoJson(): String {
+        val p = context.getSharedPreferences("dokapon", Context.MODE_PRIVATE)
+        val name = (p.getString("pname", "") ?: "").ifBlank { "โฮสต์" }
+        return JSONObject()
+            .put("name", name)
+            .put("players", peers.size + 1)
+            .put("public", p.getBoolean("public_room", true))
+            .toString()
     }
 
     private fun status(extra: String? = null) {
@@ -412,6 +625,27 @@ class Streamer(
             return
         }
         DebugLog.add("[host] เพื่อนขอเข้าห้อง: $name")
+        if (pendingJoin.containsKey(src)) {
+            sig?.send("ANSWER", src, JSONObject().put("t", "wait"))
+            return
+        }
+        if (autoAccept) {
+            admit(src, name)
+            return
+        }
+        pendingJoin[src] = name
+        sig?.send("ANSWER", src, JSONObject().put("t", "wait"))
+        onJoinRequest(src, name) { ok ->
+            main.post {
+                pendingJoin.remove(src)
+                if (!stopped) {
+                    if (ok) admit(src, name) else sig?.send("ANSWER", src, JSONObject().put("t", "denied"))
+                }
+            }
+        }
+    }
+
+    private fun admit(src: String, name: String) {
         val used = peers.values.map { it.slot }.toSet()
         val slot = listOf(1, 2, 3).firstOrNull { it !in used }
         if (slot == null) {
@@ -420,6 +654,7 @@ class Streamer(
         }
         val peer = Peer(src, slot, name.ifBlank { "Player${slot + 1}" }.take(20))
         peers[src] = peer
+        sig?.refreshPresence()
         sig?.send("ANSWER", src, JSONObject().put("t", "joined").put("slot", slot).put("name", peer.name))
         connect(peer)
         status()
@@ -525,6 +760,7 @@ class Streamer(
         held[p.slot]?.toList()?.forEach { dispatchInput(p.slot, it, false) }
         try { p.channel?.close() } catch (e: Exception) { }
         try { p.pc?.close() } catch (e: Exception) { }
+        sig?.refreshPresence()
         status()
     }
 
@@ -801,6 +1037,20 @@ class GameActivity : AppCompatActivity() {
         })
     }
 
+    private fun askJoin(name: String, decide: (Boolean) -> Unit) {
+        if (isFinishing) {
+            decide(false)
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("เพื่อนขอเข้าห้อง")
+            .setMessage("\"$name\" ขอเข้าห้องเพื่อเล่นด้วย ให้เข้าไหม?")
+            .setCancelable(false)
+            .setPositiveButton("✅ ยอมรับ") { _, _ -> decide(true) }
+            .setNegativeButton("❌ ปฏิเสธ") { _, _ -> decide(false) }
+            .show()
+    }
+
     private fun startStreaming() {
         val view = retroView
         if (view == null) {
@@ -814,6 +1064,8 @@ class GameActivity : AppCompatActivity() {
         try {
             val s = Streamer(
                 this, view, room, fps,
+                getSharedPreferences("dokapon", MODE_PRIVATE).getBoolean("auto_accept", false),
+                { _, name, decide -> runOnUiThread { askJoin(name, decide) } },
                 { slot, btn, down ->
                     val code = PadMap.code(btn)
                     if (code != null) {
@@ -951,12 +1203,13 @@ class PlayerActivity : AppCompatActivity() {
     private var swapLocal = false
     private var joinAttempts = 0
     private var joinName = ""
+    private var hostSeen = false
 
     /** ส่งคำขอเข้าห้องซ้ำทุก 3 วินาที (สูงสุด 8 ครั้ง) จนกว่าโฮสต์จะตอบ */
     private val joinRetry = object : Runnable {
         override fun run() {
             if (finished || joined) return
-            if (joinAttempts < 8) {
+            if (joinAttempts < 40) {
                 joinAttempts++
                 sig?.send("OFFER", hostId, JSONObject().put("t", "join").put("name", joinName))
                 main.postDelayed(this, 3000)
@@ -1036,16 +1289,29 @@ class PlayerActivity : AppCompatActivity() {
         val chars = "abcdefghijklmnopqrstuvwxyz0123456789"
         val rnd = java.security.SecureRandom()
         val myId = "friend-" + (1..10).map { chars[rnd.nextInt(chars.length)] }.joinToString("")
-        sig = Signaling(myId, object : Signaling.Listener {
+        sig = Signaling(this, myId, room, false, { "{}" }, object : Signaling.Listener {
             override fun onMessage(type: String, src: String?, payload: JSONObject?) {
                 if (finished) return
                 when (type) {
                     "OPEN" -> {
-                        show("เชื่อมต่อเซิร์ฟเวอร์จับคู่แล้ว กำลังขอเข้าห้อง…")
-                        joinAttempts = 0
-                        main.removeCallbacks(joinRetry)
+                        show("เชื่อมต่อเซิร์ฟเวอร์แล้ว กำลังหาห้อง…")
                         joinName = name
-                        main.post(joinRetry)
+                        main.postDelayed({
+                            if (!hostSeen && !finished && !joined) fail("ไม่พบห้องนี้ ตรวจรหัสห้อง และรอให้โฮสต์เริ่มเกมก่อน")
+                        }, 10000)
+                    }
+                    "HOST" -> {
+                        if (payload != null && payload.optBoolean("online")) {
+                            if (!hostSeen) {
+                                hostSeen = true
+                                show("พบห้องแล้ว กำลังขอเข้าห้อง…")
+                                joinAttempts = 0
+                                main.removeCallbacks(joinRetry)
+                                main.post(joinRetry)
+                            }
+                        } else if (!joined) {
+                            fail("ห้องนี้ปิดอยู่")
+                        }
                     }
                     "CLOSED" -> {
                         val m = payload?.optString("msg") ?: ""
@@ -1062,6 +1328,8 @@ class PlayerActivity : AppCompatActivity() {
                             val kind = payload.optString("t")
                             if (kind == "joined") onJoined(payload.optInt("slot"))
                             else if (kind == "full") fail("ห้องเต็มแล้ว")
+                            else if (kind == "wait") show("โฮสต์ได้รับคำขอแล้ว รอโฮสต์กดยอมรับ…")
+                            else if (kind == "denied") fail("โฮสต์ไม่อนุญาตให้เข้าห้อง")
                         }
                     }
                     "OFFER" -> {
@@ -1084,7 +1352,7 @@ class PlayerActivity : AppCompatActivity() {
 
         main.postDelayed({
             if (!joined && !finished) fail("เข้าห้องไม่สำเร็จ ตรวจรหัสห้อง และตรวจว่าโฮสต์เริ่มเกมแล้ว")
-        }, 30000)
+        }, 120000)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
