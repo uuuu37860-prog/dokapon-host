@@ -534,35 +534,50 @@ class Streamer(
         }
     }
 
-    /** แปลงภาพ ARGB ขนาด 320x240 เป็น I420 แล้วส่งให้ WebRTC */
+    private val yArr = ByteArray(frameW * frameH)
+    private val uArr = ByteArray((frameW / 2) * (frameH / 2))
+    private val vArr = ByteArray((frameW / 2) * (frameH / 2))
+
+    private fun copyPlane(dst: java.nio.ByteBuffer, dstStride: Int, srcArr: ByteArray, w: Int, h: Int) {
+        if (dstStride == w) {
+            dst.position(0)
+            dst.put(srcArr, 0, w * h)
+        } else {
+            for (row in 0 until h) {
+                dst.position(row * dstStride)
+                dst.put(srcArr, row * w, w)
+            }
+        }
+    }
+
+    /** แปลงภาพ ARGB เป็น I420 แล้วส่งให้ WebRTC */
     private fun pushFrame() {
         val src = source ?: return
         val w = frameW
         val h = frameH
         frameBitmap.getPixels(framePixels, 0, w, 0, 0, w, h)
-        val buf = JavaI420Buffer.allocate(w, h)
-        val yP = buf.dataY
-        val uP = buf.dataU
-        val vP = buf.dataV
-        val ys = buf.strideY
-        val us = buf.strideU
-        val vs = buf.strideV
+        var yi = 0
+        var ci = 0
         for (j in 0 until h) {
+            val row = j * w
+            val evenRow = (j and 1) == 0
             for (i in 0 until w) {
-                val c = framePixels[j * w + i]
+                val c = framePixels[row + i]
                 val r = (c shr 16) and 0xFF
                 val g = (c shr 8) and 0xFF
                 val b = c and 0xFF
-                val y = ((66 * r + 129 * g + 25 * b + 128) shr 8) + 16
-                yP.put(j * ys + i, y.coerceIn(0, 255).toByte())
-                if ((j and 1) == 0 && (i and 1) == 0) {
-                    val u = ((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128
-                    val v = ((112 * r - 94 * g - 18 * b + 128) shr 8) + 128
-                    uP.put((j / 2) * us + i / 2, u.coerceIn(0, 255).toByte())
-                    vP.put((j / 2) * vs + i / 2, v.coerceIn(0, 255).toByte())
+                yArr[yi++] = (((66 * r + 129 * g + 25 * b + 128) shr 8) + 16).toByte()
+                if (evenRow && (i and 1) == 0) {
+                    uArr[ci] = (((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128).coerceIn(0, 255).toByte()
+                    vArr[ci] = (((112 * r - 94 * g - 18 * b + 128) shr 8) + 128).coerceIn(0, 255).toByte()
+                    ci++
                 }
             }
         }
+        val buf = JavaI420Buffer.allocate(w, h)
+        copyPlane(buf.dataY, buf.strideY, yArr, w, h)
+        copyPlane(buf.dataU, buf.strideU, uArr, w / 2, h / 2)
+        copyPlane(buf.dataV, buf.strideV, vArr, w / 2, h / 2)
         val frame = VideoFrame(buf, 0, System.nanoTime())
         src.capturerObserver.onFrameCaptured(frame)
         frame.release()
@@ -1194,7 +1209,7 @@ class GameActivity : AppCompatActivity() {
             val s = Streamer(
                 this, view, room, fps,
                 prefs.getBoolean("auto_accept", false),
-                prefs.getInt("stream_q", 1), pool, hostPort, randomSeat,
+                prefs.getInt("stream_q", 2), pool, hostPort, randomSeat,
                 { _, name, decide -> runOnUiThread { askJoin(name, decide) } },
                 { slot, btn, down ->
                     val code = PadMap.code(btn)

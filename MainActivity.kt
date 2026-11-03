@@ -358,7 +358,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         for (r in rooms) {
-            lobbyBox.addView(button("🎮 ${r.name} · ${r.players}/4 คน · รหัส ${r.room}", false) {
+            lobbyBox.addView(button("🎮 ${r.name} · ${r.players}/${r.max} คน · รหัส ${r.room}", false) {
                 val nm = joinName.text.toString().trim().ifBlank { "ผู้เล่น" }
                 prefs().edit().putString("pname", nm).putString("pcode", r.room).apply()
                 startActivity(Intent(this, PlayerActivity::class.java).putExtra("room", r.room).putExtra("name", nm))
@@ -517,6 +517,23 @@ fun showSettingsDialog(a: AppCompatActivity) {
     toggle("เปิดห้องให้เพื่อนเข้าอัตโนมัติเมื่อเริ่มเกม", "auto_room", true)
     toggle("ยอมรับเพื่อนอัตโนมัติ (ไม่ต้องกดยอมรับทุกครั้ง)", "auto_accept", false)
 
+    box.addView(label("คุณภาพภาพสตรีม (สูงกว่า = คมกว่าแต่กินเครื่องและเน็ตมากขึ้น)"))
+    val qLabels = listOf("ต่ำ 320×240", "กลาง 480×360", "สูง 640×480")
+    val qGroup = RadioGroup(a)
+    qGroup.orientation = RadioGroup.VERTICAL
+    qLabels.forEachIndexed { i, l ->
+        val rb = RadioButton(a)
+        rb.id = 4000 + i
+        rb.text = l
+        rb.isChecked = prefs.getInt("stream_q", 2) == i
+        qGroup.addView(rb)
+    }
+    qGroup.setOnCheckedChangeListener { _, checkedId ->
+        val idx = checkedId - 4000
+        if (idx in qLabels.indices) prefs.edit().putInt("stream_q", idx).apply()
+    }
+    box.addView(qGroup)
+
     box.addView(label("สตรีม: เฟรมเรต (ลดลงถ้าเครื่องหน่วงตอนสตรีม)"))
     val fpsOptions = listOf(15, 24, 30)
     val group = RadioGroup(a)
@@ -525,7 +542,7 @@ fun showSettingsDialog(a: AppCompatActivity) {
         val rb = RadioButton(a)
         rb.id = 1000 + i
         rb.text = "$f fps"
-        rb.isChecked = prefs.getInt("stream_fps", 24) == f
+        rb.isChecked = prefs.getInt("stream_fps", 30) == f
         group.addView(rb)
     }
     group.setOnCheckedChangeListener { _, checkedId ->
