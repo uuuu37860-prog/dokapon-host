@@ -447,8 +447,11 @@ class Streamer(
     private val poolSize: Int,
     val hostSlot: Int,
     private val randomSeat: Boolean,
+    private val turnLock: Boolean,
+    private val useHw: Boolean,
     private val onJoinRequest: (src: String, name: String, decide: (Boolean, Int) -> Unit) -> Unit,
     private val onInput: (slot: Int, btn: Int, down: Boolean) -> Unit,
+    private val onTurn: (seat: Int, name: String, lock: Boolean) -> Unit,
     private val onStatus: (String) -> Unit
 ) {
     private class Peer(val id: String, var slot: Int, val name: String) {
@@ -486,11 +489,17 @@ class Streamer(
     }
 
     /** ดึงภาพเฉพาะตัวเกมจาก GLRetroView ด้วย PixelCopy (ไม่จับทั้งหน้าจอ ไม่มีปุ่ม/แจ้งเตือนติดไปด้วย) */
+    private var nextGrabAt = 0L
     private val grabTask = object : Runnable {
         override fun run() {
             if (stopped) return
             grabOnce()
-            main.postDelayed(this, (1000 / fps).toLong())
+            val interval = (1000 / fps).toLong()
+            val now = android.os.SystemClock.uptimeMillis()
+            if (nextGrabAt == 0L) nextGrabAt = now
+            nextGrabAt += interval
+            if (nextGrabAt < now) nextGrabAt = now + interval
+            main.postAtTime(this, nextGrabAt)
         }
     }
 
@@ -594,6 +603,7 @@ class Streamer(
         grabThread = thread
         grabHandler = Handler(thread.looper)
         main.post(grabTask)
+        main.postDelayed(turnTicker, 3000)
 
         sig = Signaling(context, hostId, room, true, { hostInfoJson() }, object : Signaling.Listener {
             override fun onMessage(type: String, src: String?, payload: JSONObject?) {
@@ -602,6 +612,95 @@ class Streamer(
         })
         sig?.connect()
         status("กำลังเชื่อมต่อห้อง…")
+    }
+
+    // ---------- ระบบสลับตา: เฉพาะผู้ถือตาเท่านั้นที่กดปุ่มได้ กด "จบตา" เพื่อส่งต่อให้คนถัดไป ----------
+    private var holder: String = "host"
+    private val turnTicker = object : Runnable {
+        override fun run() {
+            if (stopped) return
+            broadcastTurn()
+            main.postDelayed(this, 3000)
+        }
+    }
+
+    private fun hostName(): String {
+        val p = context.getSharedPreferences("dokapon", Context.MODE_PRIVATE)
+        return (p.getString("pname", "") ?: "").ifBlank { "โฮสต์" }
+    }
+
+    private fun turnSeat(): Int = if (holder == "host") hostSlot else (peers[holder]?.slot ?: hostSlot)
+    private fun turnName(): String = if (holder == "host") hostName() else (peers[holder]?.name ?: hostName())
+    private fun allowed(slot: Int): Boolean = !turnLock || slot == turnSeat()
+
+    /** โฮสต์กดปุ่มได้ไหม (ตอนนี้ถึงตาโฮสต์หรือปิดโหมดสลับตา) */
+    fun hostMayPress(): Boolean = !turnLock || holder == "host"
+
+    private fun advance() {
+        val order = ArrayList<Pair<String, Int>>()
+        order.add("host" to hostSlot)
+        for (p in peers.values) order.add(p.id to p.slot)
+        order.sortBy { it.second }
+        val idx = order.indexOfFirst { it.first == holder }
+        val next = order[(if (idx < 0) 0 else idx + 1) % order.size].first
+        if (holder != "host") peers[holder]?.let { releaseSlot(it.slot) }
+        holder = next
+        DebugLog.add("[host] ส่งต่อตาให้ ${turnName()}")
+        notifyTurn()
+    }
+
+    /** โฮสต์กดจบตา คืนค่า false ถ้ายังไม่ถึงตาโฮสต์ */
+    fun hostEndTurn(): Boolean {
+        if (!turnLock || holder != "host") return false
+        advance()
+        return true
+    }
+
+    private fun endTurnBy(id: String) {
+        if (turnLock && holder == id) advance()
+    }
+
+    private fun notifyTurn() {
+        onTurn(turnSeat(), turnName(), turnLock)
+        broadcastTurn()
+        status()
+    }
+
+    private fun broadcastTurn() {
+        val msg = JSONObject().put("turn", turnSeat()).put("name", turnName()).put("lock", turnLock).toString()
+        for (p in peers.values) {
+            val ch = p.channel ?: continue
+            if (ch.state() != DataChannel.State.OPEN) continue
+            try {
+                ch.send(DataChannel.Buffer(java.nio.ByteBuffer.wrap(msg.toByteArray()), false))
+            } catch (e: Exception) {
+                // ส่งไม่ได้ รอบถัดไปค่อยส่งใหม่
+            }
+        }
+    }
+
+    private fun preferH264(sdp: String): String {
+        try {
+            val lines = sdp.split("\r\n").toMutableList()
+            val mIdx = lines.indexOfFirst { it.startsWith("m=video") }
+            if (mIdx < 0) return sdp
+            val rtpmap = Regex("^a=rtpmap:(\\d+) H264/90000")
+            val h264 = ArrayList<String>()
+            for (l in lines) {
+                val m = rtpmap.find(l)
+                if (m != null) h264.add(m.groupValues[1])
+            }
+            if (h264.isEmpty()) return sdp
+            val parts = lines[mIdx].split(" ")
+            if (parts.size < 4) return sdp
+            val header = parts.subList(0, 3)
+            val pts = parts.subList(3, parts.size)
+            val ordered = h264.filter { it in pts } + pts.filter { it !in h264 }
+            lines[mIdx] = (header + ordered).joinToString(" ")
+            return lines.joinToString("\r\n")
+        } catch (e: Exception) {
+            return sdp
+        }
     }
 
     private fun hostInfoJson(): String {
@@ -616,7 +715,7 @@ class Streamer(
     }
 
     private fun status(extra: String? = null) {
-        onStatus(extra ?: "ห้อง $room · คุณคือผู้เล่น ${hostSlot + 1} · เพื่อน ${peers.size} คน")
+        onStatus(extra ?: ("ห้อง $room · คุณคือผู้เล่น ${hostSlot + 1} · เพื่อน ${peers.size} คน" + if (turnLock) " · ถึงตา: ${turnName()}" else ""))
     }
 
     private fun onSignal(type: String, src: String?, p: JSONObject?) {
@@ -772,6 +871,10 @@ class Streamer(
                     val bytes = ByteArray(buffer.data.remaining())
                     buffer.data.get(bytes)
                     val j = JSONObject(String(bytes))
+                    if (j.has("e")) {
+                        main.post { endTurnBy(peer.id) }
+                        return
+                    }
                     val btn = j.getInt("b")
                     val down = j.getInt("d") == 1
                     main.post { dispatchInput(peer.slot, btn, down) }
@@ -782,15 +885,17 @@ class Streamer(
         })
 
         pc.createOffer(SdpAdapter { offer ->
-            pc.setLocalDescription(SdpAdapter(), offer)
+            val desc = if (useHw) SessionDescription(offer.type, preferH264(offer.description)) else offer
+            pc.setLocalDescription(SdpAdapter(), desc)
             sig?.send(
                 "OFFER", peer.id,
-                JSONObject().put("t", "sdp").put("type", "offer").put("sdp", offer.description)
+                JSONObject().put("t", "sdp").put("type", "offer").put("sdp", desc.description)
             )
         }, MediaConstraints())
     }
 
     private fun dispatchInput(slot: Int, btn: Int, down: Boolean) {
+        if (down && !allowed(slot)) return
         val set = held.getOrPut(slot) { mutableSetOf() }
         if (down) set.add(btn) else set.remove(btn)
         onInput(slot, btn, down)
@@ -801,8 +906,9 @@ class Streamer(
         held[p.slot]?.toList()?.forEach { dispatchInput(p.slot, it, false) }
         try { p.channel?.close() } catch (e: Exception) { }
         try { p.pc?.close() } catch (e: Exception) { }
+        if (holder == id) holder = "host"
         sig?.refreshPresence()
-        status()
+        notifyTurn()
     }
 
     // ---------- จัดลำดับผู้เล่นโดยเจ้าของห้อง ----------
@@ -848,7 +954,7 @@ class Streamer(
         }
         notifySlot(p)
         DebugLog.add("[host] ย้าย ${p.name} ไปผู้เล่น ${newSlot + 1}")
-        status()
+        notifyTurn()
     }
 
     fun stop() {
@@ -857,6 +963,7 @@ class Streamer(
         peers.keys.toList().forEach { drop(it) }
         sig?.close()
         main.removeCallbacks(grabTask)
+        main.removeCallbacks(turnTicker)
         try { source?.capturerObserver?.onCapturerStopped() } catch (e: Exception) { }
         try { grabThread?.quitSafely() } catch (e: Exception) { }
         try { track?.dispose() } catch (e: Exception) { }
@@ -872,6 +979,7 @@ class GameActivity : AppCompatActivity() {
     private var streamer: Streamer? = null
     private lateinit var statusView: TextView
     private lateinit var streamBtn: TextView
+    private lateinit var endBtn: TextView
 
     private var gameKey = "game"
     private var lastSramHash = 0
@@ -1086,7 +1194,18 @@ class GameActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    private var lastBlockToast = 0L
+
     private fun press(code: Int, down: Boolean) {
+        val s = streamer
+        if (down && s != null && !s.hostMayPress()) {
+            val now = System.currentTimeMillis()
+            if (now - lastBlockToast > 1500) {
+                lastBlockToast = now
+                toast("ยังไม่ถึงตาคุณ")
+            }
+            return
+        }
         retroView?.sendKeyEvent(if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP, code, hostPort)
     }
 
@@ -1119,6 +1238,23 @@ class GameActivity : AppCompatActivity() {
             setOnClickListener { showMenu() }
         }
         bar.addView(gear, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(8) })
+        endBtn = TextView(this).apply {
+            text = "⏭ จบตา"
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setTextColor(Color.BLACK)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.rgb(242, 193, 78)) }
+            visibility = View.GONE
+            setOnClickListener {
+                val st = streamer
+                if (st == null || !st.hostEndTurn()) toast("ยังไม่ถึงตาคุณ")
+            }
+        }
+        root.addView(endBtn, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            rightMargin = dp(16)
+        })
         bar.addView(statusView)
         bar.addView(streamBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(8) })
         root.addView(bar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -1210,11 +1346,18 @@ class GameActivity : AppCompatActivity() {
                 this, view, room, fps,
                 prefs.getBoolean("auto_accept", false),
                 prefs.getInt("stream_q", 2), pool, hostPort, randomSeat,
+                prefs.getBoolean("turn_lock", true), prefs.getBoolean("hw_codec", true),
                 { _, name, decide -> runOnUiThread { askJoin(name, decide) } },
                 { slot, btn, down ->
                     val code = PadMap.code(btn)
                     if (code != null) {
                         retroView?.sendKeyEvent(if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP, code, slot)
+                    }
+                },
+                { seat, _, lock ->
+                    runOnUiThread {
+                        endBtn.visibility = if (lock) View.VISIBLE else View.GONE
+                        endBtn.alpha = if (seat == hostPort) 1f else 0.45f
                     }
                 },
                 { text -> runOnUiThread { statusView.text = text } }
@@ -1349,6 +1492,31 @@ class PlayerActivity : AppCompatActivity() {
     private var joinAttempts = 0
     private var joinName = ""
     private var hostSeen = false
+    private var mySlot = -1
+    private var turnSeat = -1
+    private var turnLock = false
+    private var turnName = ""
+    private var lastBlockToast = 0L
+    private lateinit var endBtn: TextView
+
+    private fun refreshBadge() {
+        badge.text = "ผู้เล่น ${mySlot + 1}" + if (turnLock && turnName.isNotEmpty()) " · ถึงตา: $turnName" else ""
+    }
+
+    private fun onTurn(seat: Int, name: String, lock: Boolean) {
+        turnSeat = seat
+        turnLock = lock
+        turnName = name
+        endBtn.visibility = if (lock) View.VISIBLE else View.GONE
+        endBtn.alpha = if (seat == mySlot) 1f else 0.45f
+        refreshBadge()
+    }
+
+    private fun sendEndTurn() {
+        val ch = channel ?: return
+        if (ch.state() != DataChannel.State.OPEN) return
+        ch.send(DataChannel.Buffer(java.nio.ByteBuffer.wrap("{\"e\":1}".toByteArray()), false))
+    }
 
     /** ส่งคำขอเข้าห้องซ้ำทุก 3 วินาที (สูงสุด 8 ครั้ง) จนกว่าโฮสต์จะตอบ */
     private val joinRetry = object : Runnable {
@@ -1493,8 +1661,9 @@ class PlayerActivity : AppCompatActivity() {
                             else if (kind == "wait") show("โฮสต์ได้รับคำขอแล้ว รอโฮสต์กดยอมรับ…")
                             else if (kind == "denied") fail("โฮสต์ไม่อนุญาตให้เข้าห้อง")
                             else if (kind == "slot") {
-                                val n = payload.optInt("slot") + 1
-                                badge.text = "ผู้เล่น $n"
+                                mySlot = payload.optInt("slot")
+                                val n = mySlot + 1
+                                refreshBadge()
                                 Toast.makeText(this@PlayerActivity, "โฮสต์ย้ายคุณเป็นผู้เล่น $n", Toast.LENGTH_LONG).show()
                             }
                         }
@@ -1530,6 +1699,7 @@ class PlayerActivity : AppCompatActivity() {
 
     private fun onJoined(slot: Int) {
         joined = true
+        mySlot = slot
         badge.text = "ผู้เล่น ${slot + 1}"
         badge.visibility = View.VISIBLE
         show("โฮสต์ตอบรับแล้ว กำลังรอภาพ…")
@@ -1580,6 +1750,25 @@ class PlayerActivity : AppCompatActivity() {
             override fun onRemoveStream(s: MediaStream?) {}
             override fun onDataChannel(d: DataChannel?) {
                 channel = d
+                d?.registerObserver(object : DataChannel.Observer {
+                    override fun onBufferedAmountChange(l: Long) {}
+                    override fun onStateChange() {}
+                    override fun onMessage(buffer: DataChannel.Buffer) {
+                        try {
+                            val bytes = ByteArray(buffer.data.remaining())
+                            buffer.data.get(bytes)
+                            val j = JSONObject(String(bytes))
+                            if (j.has("turn")) {
+                                val seat = j.optInt("turn")
+                                val nm = j.optString("name")
+                                val lock = j.optBoolean("lock", false)
+                                main.post { onTurn(seat, nm, lock) }
+                            }
+                        } catch (e: Exception) {
+                            // ข้อความที่อ่านไม่ได้ ข้ามไป
+                        }
+                    }
+                })
             }
             override fun onRenegotiationNeeded() {}
             override fun onAddTrack(r: RtpReceiver?, s: Array<out MediaStream>?) {
@@ -1652,6 +1841,14 @@ class PlayerActivity : AppCompatActivity() {
 
     // ---------- ส่งปุ่มให้โฮสต์ (รหัสปุ่มแบบ RetroPad) ----------
     private fun sendBtn(idx: Int, down: Boolean) {
+        if (down && turnLock && turnSeat != mySlot) {
+            val now = System.currentTimeMillis()
+            if (now - lastBlockToast > 1500) {
+                lastBlockToast = now
+                Toast.makeText(this, "ยังไม่ถึงตาคุณ", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
         if (down == held.contains(idx)) return
         if (down) held.add(idx) else held.remove(idx)
         val ch = channel ?: return
@@ -1741,6 +1938,28 @@ class PlayerActivity : AppCompatActivity() {
         shoulder("L1", 10, true, 1)
         shoulder("R2", 13, false, 0)
         shoulder("R1", 11, false, 1)
+
+        endBtn = TextView(this).apply {
+            text = "⏭ จบตา"
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setTextColor(Color.BLACK)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.rgb(242, 193, 78)) }
+            visibility = View.GONE
+            setOnClickListener {
+                if (!turnLock) return@setOnClickListener
+                if (turnSeat != mySlot) {
+                    Toast.makeText(this@PlayerActivity, "ยังไม่ถึงตาคุณ", Toast.LENGTH_SHORT).show()
+                } else {
+                    sendEndTurn()
+                }
+            }
+        }
+        root.addView(endBtn, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            rightMargin = margin
+        })
 
         val mid = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         mid.addView(pad("Select", 2), LinearLayout.LayoutParams(dp(78), dp(34)).apply { rightMargin = dp(10) })
