@@ -449,6 +449,7 @@ class Streamer(
     private val randomSeat: Boolean,
     private val turnLock: Boolean,
     private val useHw: Boolean,
+    private val sharpen: Boolean,
     private val onJoinRequest: (src: String, name: String, decide: (Boolean, Int) -> Unit) -> Unit,
     private val onInput: (slot: Int, btn: Int, down: Boolean) -> Unit,
     private val onTurn: (seat: Int, name: String, lock: Boolean) -> Unit,
@@ -466,7 +467,7 @@ class Streamer(
     private var track: VideoTrack? = null
     private var grabThread: HandlerThread? = null
     private var grabHandler: Handler? = null
-    private val frameW: Int = when (quality) { 0 -> 320; 2 -> 640; else -> 480 }
+    private val frameW: Int = when (quality) { 0 -> 320; 2 -> 640; 3 -> 960; else -> 480 }
     private val frameH: Int = frameW * 3 / 4
     private val frameBitmap: Bitmap = Bitmap.createBitmap(frameW, frameH, Bitmap.Config.ARGB_8888)
     private val framePixels = IntArray(frameW * frameH)
@@ -543,6 +544,7 @@ class Streamer(
         }
     }
 
+    private val yRaw = ByteArray(frameW * frameH)
     private val yArr = ByteArray(frameW * frameH)
     private val uArr = ByteArray((frameW / 2) * (frameH / 2))
     private val vArr = ByteArray((frameW / 2) * (frameH / 2))
@@ -575,11 +577,26 @@ class Streamer(
                 val r = (c shr 16) and 0xFF
                 val g = (c shr 8) and 0xFF
                 val b = c and 0xFF
-                yArr[yi++] = (((66 * r + 129 * g + 25 * b + 128) shr 8) + 16).toByte()
+                yRaw[yi++] = (((66 * r + 129 * g + 25 * b + 128) shr 8) + 16).toByte()
                 if (evenRow && (i and 1) == 0) {
                     uArr[ci] = (((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128).coerceIn(0, 255).toByte()
                     vArr[ci] = (((112 * r - 94 * g - 18 * b + 128) shr 8) + 128).coerceIn(0, 255).toByte()
                     ci++
+                }
+            }
+        }
+        // เพิ่มความคมชัดของภาพ (unsharp แบบเบา) ชดเชยความนุ่มจากการย่อ/ขยายหลายรอบ
+        System.arraycopy(yRaw, 0, yArr, 0, w * h)
+        if (sharpen) {
+            for (j in 1 until h - 1) {
+                var idx = j * w + 1
+                for (i in 1 until w - 1) {
+                    val c = yRaw[idx].toInt() and 0xFF
+                    val n = (yRaw[idx - 1].toInt() and 0xFF) + (yRaw[idx + 1].toInt() and 0xFF) +
+                        (yRaw[idx - w].toInt() and 0xFF) + (yRaw[idx + w].toInt() and 0xFF)
+                    val v = c + ((4 * c - n) shr 1)
+                    yArr[idx] = (if (v < 16) 16 else if (v > 235) 235 else v).toByte()
+                    idx++
                 }
             }
         }
@@ -612,6 +629,7 @@ class Streamer(
         })
         sig?.connect()
         status("กำลังเชื่อมต่อห้อง…")
+        onTurn(turnSeat(), turnName(), turnLock)
     }
 
     // ---------- ระบบสลับตา: เฉพาะผู้ถือตาเท่านั้นที่กดปุ่มได้ กด "จบตา" เพื่อส่งต่อให้คนถัดไป ----------
@@ -619,6 +637,7 @@ class Streamer(
     private val turnTicker = object : Runnable {
         override fun run() {
             if (stopped) return
+            onTurn(turnSeat(), turnName(), turnLock)
             broadcastTurn()
             main.postDelayed(this, 3000)
         }
@@ -795,7 +814,7 @@ class Streamer(
         sig?.refreshPresence()
         sig?.send("ANSWER", src, JSONObject().put("t", "joined").put("slot", slot).put("name", peer.name))
         connect(peer)
-        status()
+        notifyTurn()
     }
 
     private fun connect(peer: Peer) {
@@ -849,7 +868,7 @@ class Streamer(
             val sender = pc.addTrack(t, listOf("game"))
             try {
                 val params = sender.parameters
-                val maxBps = when (quality) { 0 -> 1_500_000; 2 -> 4_000_000; else -> 2_500_000 }
+                val maxBps = when (quality) { 0 -> 1_500_000; 2 -> 4_000_000; 3 -> 6_000_000; else -> 2_500_000 }
                 for (e in params.encodings) {
                     e.maxBitrateBps = maxBps
                     e.minBitrateBps = maxBps / 3
@@ -1346,7 +1365,7 @@ class GameActivity : AppCompatActivity() {
                 this, view, room, fps,
                 prefs.getBoolean("auto_accept", false),
                 prefs.getInt("stream_q", 2), pool, hostPort, randomSeat,
-                prefs.getBoolean("turn_lock", true), prefs.getBoolean("hw_codec", true),
+                prefs.getBoolean("turn_lock", true), prefs.getBoolean("hw_codec", true), prefs.getBoolean("sharpen", true),
                 { _, name, decide -> runOnUiThread { askJoin(name, decide) } },
                 { slot, btn, down ->
                     val code = PadMap.code(btn)

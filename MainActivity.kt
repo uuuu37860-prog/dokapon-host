@@ -517,10 +517,11 @@ fun showSettingsDialog(a: AppCompatActivity) {
     toggle("เปิดห้องให้เพื่อนเข้าอัตโนมัติเมื่อเริ่มเกม", "auto_room", true)
     toggle("ยอมรับเพื่อนอัตโนมัติ (ไม่ต้องกดยอมรับทุกครั้ง)", "auto_accept", false)
     toggle("โหมดสลับตา (เฉพาะคนที่ถึงตากดปุ่มได้ มีปุ่ม \"จบตา\" ส่งต่อให้คนถัดไป)", "turn_lock", true)
+    toggle("เพิ่มความคมชัดภาพสตรีม (ช่วยให้ตัวหนังสือและขอบภาพชัดขึ้น)", "sharpen", true)
     toggle("เข้ารหัสวิดีโอด้วยฮาร์ดแวร์ H.264 (ช่วยลดอาการกระตุก ถ้าภาพไม่ขึ้นให้ปิด)", "hw_codec", true)
 
     box.addView(label("คุณภาพภาพสตรีม (สูงกว่า = คมกว่าแต่กินเครื่องและเน็ตมากขึ้น)"))
-    val qLabels = listOf("ต่ำ 320×240", "กลาง 480×360", "สูง 640×480")
+    val qLabels = listOf("ต่ำ 320×240", "กลาง 480×360", "สูง 640×480", "สูงมาก 960×720 (กินเครื่องมาก)")
     val qGroup = RadioGroup(a)
     qGroup.orientation = RadioGroup.VERTICAL
     qLabels.forEachIndexed { i, l ->
