@@ -22,6 +22,8 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
+import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.PixelCopy
@@ -73,7 +75,9 @@ import org.webrtc.MediaStream
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.RendererCommon
+import org.webrtc.RTCStatsReport
 import org.webrtc.RtpReceiver
+import org.webrtc.RtpSender
 import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
@@ -114,6 +118,93 @@ object PadMap {
     }
 }
 
+/** จอยบลูทูธ/จอยต่อสาย: แปลงรหัสปุ่มของ Android เป็นรหัสปุ่มแบบ RetroPad ของแอป */
+object GamepadMap {
+    fun isGamepad(e: KeyEvent): Boolean =
+        (e.source and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+            (e.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+
+    /** 0=✕ 1=□ 2=Select 3=Start 4=ขึ้น 5=ลง 6=ซ้าย 7=ขวา 8=○ 9=△ 10=L1 11=R1 12=L2 13=R2 */
+    fun index(keyCode: Int): Int? = when (keyCode) {
+        KeyEvent.KEYCODE_BUTTON_A -> 0
+        KeyEvent.KEYCODE_BUTTON_X -> 1
+        KeyEvent.KEYCODE_BUTTON_SELECT -> 2
+        KeyEvent.KEYCODE_BUTTON_START -> 3
+        KeyEvent.KEYCODE_DPAD_UP -> 4
+        KeyEvent.KEYCODE_DPAD_DOWN -> 5
+        KeyEvent.KEYCODE_DPAD_LEFT -> 6
+        KeyEvent.KEYCODE_DPAD_RIGHT -> 7
+        KeyEvent.KEYCODE_BUTTON_B -> 8
+        KeyEvent.KEYCODE_BUTTON_Y -> 9
+        KeyEvent.KEYCODE_BUTTON_L1 -> 10
+        KeyEvent.KEYCODE_BUTTON_R1 -> 11
+        KeyEvent.KEYCODE_BUTTON_L2 -> 12
+        KeyEvent.KEYCODE_BUTTON_R2 -> 13
+        else -> null
+    }
+
+    /** แกนอนาล็อก/ปุ่มกากบาท (hat)/ไกด้านบน -> ปุ่มทิศทางและ L2/R2 */
+    fun processAxes(event: MotionEvent, held: BooleanArray, emit: (Int, Boolean) -> Unit) {
+        var x = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+        var y = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+        if (x == 0f && y == 0f) {
+            x = event.getAxisValue(MotionEvent.AXIS_X)
+            y = event.getAxisValue(MotionEvent.AXIS_Y)
+        }
+        val lt = maxOf(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_BRAKE))
+        val rt = maxOf(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), event.getAxisValue(MotionEvent.AXIS_GAS))
+        val want = booleanArrayOf(y < -0.5f, y > 0.5f, x < -0.5f, x > 0.5f, lt > 0.5f, rt > 0.5f)
+        val idx = intArrayOf(4, 5, 6, 7, 12, 13)
+        for (k in 0 until 6) {
+            if (want[k] != held[k]) {
+                held[k] = want[k]
+                emit(idx[k], want[k])
+            }
+        }
+    }
+}
+
+data class NetStats(val pingMs: Int, val text: String)
+
+/** สรุปสถิติ WebRTC: ปิงกี่ ms, ต่อตรงหรือผ่านรีเลย์, เฟรมเรต, ตัวเข้ารหัส/ถอดรหัสเป็นฮาร์ดแวร์หรือไม่ */
+object StatsUtil {
+    fun summarize(report: RTCStatsReport, sender: Boolean): NetStats {
+        val map = report.statsMap
+        var rtt = -1.0
+        var path = "?"
+        for (st in map.values) {
+            if (st.type == "candidate-pair") {
+                val m = st.members
+                if (m["nominated"] == true && m["state"] == "succeeded") {
+                    val r = m["currentRoundTripTime"]
+                    if (r is Double) rtt = r
+                    val lid = m["localCandidateId"]
+                    if (lid is String) {
+                        val lc = map[lid]
+                        val t = lc?.members?.get("candidateType")
+                        if (t is String) path = t
+                    }
+                }
+            }
+        }
+        var info = ""
+        for (st in map.values) {
+            val m = st.members
+            if (sender && st.type == "outbound-rtp" && m["kind"] == "video") {
+                val fps = (m["framesPerSecond"] as? Double)?.toInt() ?: 0
+                info = "ส่ง ${fps}fps ${m["frameWidth"]}x${m["frameHeight"]} เข้ารหัส=${m["encoderImplementation"] ?: "?"} จำกัด=${m["qualityLimitationReason"] ?: "-"}"
+            }
+            if (!sender && st.type == "inbound-rtp" && m["kind"] == "video") {
+                val fps = (m["framesPerSecond"] as? Double)?.toInt() ?: 0
+                info = "รับ ${fps}fps ตกเฟรม=${m["framesDropped"] ?: 0} ถอดรหัส=${m["decoderImplementation"] ?: "?"}"
+            }
+        }
+        val ping = if (rtt >= 0) (rtt * 1000).toInt() else -1
+        val pingText = if (ping >= 0) "${ping}ms" else "-"
+        return NetStats(ping, "ปิง $pingText · เส้นทาง $path · $info")
+    }
+}
+
 /** Foreground service จำเป็นสำหรับการจับภาพหน้าจอบน Android 10 ขึ้นไป */
 class StreamService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
@@ -144,7 +235,7 @@ object DebugLog {
     fun add(text: String) {
         val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
         lines.add("$t $text")
-        while (lines.size > 60) lines.removeAt(0)
+        while (lines.size > 150) lines.removeAt(0)
     }
 
     @Synchronized
@@ -456,6 +547,8 @@ class Streamer(
     private val onStatus: (String) -> Unit
 ) {
     private class Peer(val id: String, var slot: Int, val name: String) {
+        var stats: String = ""
+        var sender: RtpSender? = null
         var pc: PeerConnection? = null
         var channel: DataChannel? = null
     }
@@ -475,6 +568,7 @@ class Streamer(
     private var sig: Signaling? = null
     private val peers = HashMap<String, Peer>()
     private val pendingJoin = HashMap<String, String>()
+    private val recent = HashMap<String, Pair<Int, Long>>()
     private val held = HashMap<Int, MutableSet<Int>>()
     private var stopped = false
     private val hostId = "dokapon-$room"
@@ -490,24 +584,40 @@ class Streamer(
     }
 
     /** ดึงภาพเฉพาะตัวเกมจาก GLRetroView ด้วย PixelCopy (ไม่จับทั้งหน้าจอ ไม่มีปุ่ม/แจ้งเตือนติดไปด้วย) */
-    private var nextGrabAt = 0L
+    private var tickThread: HandlerThread? = null
+    private var tickHandler: Handler? = null
+    @Volatile private var hasPeers = false
+    private var nextGrabNs = 0L
+
+    // ตัวแปรวัดผล (เขียนจากเธรด frame-grab และอ่านที่เดียวกันเท่านั้น ยกเว้น statSkip ที่ใช้เธรด frame-tick)
+    private var statN = 0
+    private var statSumNs = 0L
+    private var statMaxNs = 0L
+    @Volatile private var statSkip = 0
+    private var statSince = System.nanoTime()
+
     private val grabTask = object : Runnable {
         override fun run() {
             if (stopped) return
             grabOnce()
-            val interval = (1000 / fps).toLong()
-            val now = android.os.SystemClock.uptimeMillis()
-            if (nextGrabAt == 0L) nextGrabAt = now
-            nextGrabAt += interval
-            if (nextGrabAt < now) nextGrabAt = now + interval
-            main.postAtTime(this, nextGrabAt)
+            val interval = 1_000_000_000L / fps
+            val now = System.nanoTime()
+            if (nextGrabNs == 0L) nextGrabNs = now
+            nextGrabNs += interval
+            if (nextGrabNs < now) nextGrabNs = now + interval
+            val delayMs = ((nextGrabNs - now) / 1_000_000L).coerceAtLeast(0)
+            tickHandler?.postDelayed(this, delayMs)
         }
     }
 
     private var loggedGrabSize = false
 
     private fun grabOnce() {
-        if (grabbing || peers.isEmpty()) return
+        if (grabbing) {
+            if (hasPeers) statSkip++
+            return
+        }
+        if (!hasPeers) return
         if (!surface.holder.surface.isValid) return
         // PixelCopy ใช้พิกัดของ "พื้นผิวภาพ" (surface) ซึ่งอาจต่างจากขนาดของ View
         val f = surface.holder.surfaceFrame
@@ -533,8 +643,9 @@ class Streamer(
         grabbing = true
         try {
             PixelCopy.request(surface, Rect(left, top, left + rw, top + rh), frameBitmap, { result ->
+                val ts = System.nanoTime() // เวลาที่ภาพถูกคัดลอกเสร็จ ใช้เป็น timestamp ของเฟรม
                 try {
-                    if (result == PixelCopy.SUCCESS) pushFrame()
+                    if (result == PixelCopy.SUCCESS) pushFrame(ts)
                 } finally {
                     grabbing = false
                 }
@@ -562,7 +673,8 @@ class Streamer(
     }
 
     /** แปลงภาพ ARGB เป็น I420 แล้วส่งให้ WebRTC */
-    private fun pushFrame() {
+    private fun pushFrame(captureNs: Long) {
+        val t0 = System.nanoTime()
         val src = source ?: return
         val w = frameW
         val h = frameH
@@ -604,9 +716,24 @@ class Streamer(
         copyPlane(buf.dataY, buf.strideY, yArr, w, h)
         copyPlane(buf.dataU, buf.strideU, uArr, w / 2, h / 2)
         copyPlane(buf.dataV, buf.strideV, vArr, w / 2, h / 2)
-        val frame = VideoFrame(buf, 0, System.nanoTime())
+        val frame = VideoFrame(buf, 0, captureNs)
         src.capturerObserver.onFrameCaptured(frame)
         frame.release()
+        val dt = System.nanoTime() - t0
+        statN++
+        statSumNs += dt
+        if (dt > statMaxNs) statMaxNs = dt
+        if (System.nanoTime() - statSince > 2_000_000_000L) {
+            DebugLog.add(
+                "[host] แปลงภาพเฉลี่ย ${statSumNs / statN / 1_000_000} ms สูงสุด ${statMaxNs / 1_000_000} ms " +
+                    "ส่ง $statN เฟรม ข้าม $statSkip ใน 2 วินาที"
+            )
+            statN = 0
+            statSumNs = 0
+            statMaxNs = 0
+            statSkip = 0
+            statSince = System.nanoTime()
+        }
     }
 
     fun start() {
@@ -619,8 +746,13 @@ class Streamer(
         thread.start()
         grabThread = thread
         grabHandler = Handler(thread.looper)
-        main.post(grabTask)
+        val tick = HandlerThread("frame-tick")
+        tick.start()
+        tickThread = tick
+        tickHandler = Handler(tick.looper)
+        tickHandler?.post(grabTask)
         main.postDelayed(turnTicker, 3000)
+        main.postDelayed(statsTicker, 5000)
 
         sig = Signaling(context, hostId, room, true, { hostInfoJson() }, object : Signaling.Listener {
             override fun onMessage(type: String, src: String?, payload: JSONObject?) {
@@ -633,6 +765,24 @@ class Streamer(
     }
 
     // ---------- ระบบสลับตา: เฉพาะผู้ถือตาเท่านั้นที่กดปุ่มได้ กด "จบตา" เพื่อส่งต่อให้คนถัดไป ----------
+    private val statsTicker = object : Runnable {
+        override fun run() {
+            if (stopped) return
+            for (p in peers.values) {
+                val c = p.pc ?: continue
+                c.getStats { r ->
+                    val t = StatsUtil.summarize(r, true).text
+                    DebugLog.add("[host] ${p.name}: $t")
+                    main.post { p.stats = t }
+                }
+            }
+            main.postDelayed(this, 5000)
+        }
+    }
+
+    fun statsSummary(): String =
+        peers.values.joinToString("\n") { "${it.name} (ผู้เล่น ${it.slot + 1}): ${it.stats.ifBlank { "กำลังวัด…" }}" }
+
     private var holder: String = "host"
     private val turnTicker = object : Runnable {
         override fun run() {
@@ -722,6 +872,30 @@ class Streamer(
         }
     }
 
+    private fun budgetBps(): Int = when (quality) {
+        0 -> 600_000
+        1 -> 1_000_000
+        2 -> 2_000_000
+        else -> 3_500_000
+    }
+
+    /** บิตเรตต่อเพื่อน: อัปโหลดรวมทั้งห้องไม่เกิน 2 เท่าของบิตเรตคนเดียว และไม่บังคับขั้นต่ำ */
+    private fun applyBitrate(p: Peer) {
+        val sender = p.sender ?: return
+        try {
+            val perPeer = minOf(budgetBps(), budgetBps() * 2 / maxOf(1, peers.size))
+            val params = sender.parameters
+            for (e in params.encodings) {
+                e.maxBitrateBps = perPeer
+                e.minBitrateBps = null
+                e.maxFramerate = fps
+            }
+            sender.setParameters(params)
+        } catch (e: Exception) {
+            // ตั้งไม่ได้ ใช้ค่าเริ่มต้นของ WebRTC
+        }
+    }
+
     private fun hostInfoJson(): String {
         val p = context.getSharedPreferences("dokapon", Context.MODE_PRIVATE)
         val name = (p.getString("pname", "") ?: "").ifBlank { "โฮสต์" }
@@ -784,6 +958,12 @@ class Streamer(
             sig?.send("ANSWER", src, JSONObject().put("t", "wait"))
             return
         }
+        val rec = recent[name]
+        if (rec != null && rec.second > System.currentTimeMillis()) {
+            DebugLog.add("[host] $name กลับเข้าห้องภายใน 5 นาที รับเข้าอัตโนมัติ")
+            admit(src, name, rec.first)
+            return
+        }
         if (autoAccept) {
             admit(src, name, -1)
             return
@@ -811,9 +991,11 @@ class Streamer(
         }
         val peer = Peer(src, slot, name.ifBlank { "Player${slot + 1}" }.take(20))
         peers[src] = peer
+        hasPeers = peers.isNotEmpty()
         sig?.refreshPresence()
         sig?.send("ANSWER", src, JSONObject().put("t", "joined").put("slot", slot).put("name", peer.name))
         connect(peer)
+        peers.values.forEach { applyBitrate(it) }
         notifyTurn()
     }
 
@@ -865,19 +1047,8 @@ class Streamer(
 
         val t = track
         if (t != null) {
-            val sender = pc.addTrack(t, listOf("game"))
-            try {
-                val params = sender.parameters
-                val maxBps = when (quality) { 0 -> 1_500_000; 2 -> 4_000_000; 3 -> 6_000_000; else -> 2_500_000 }
-                for (e in params.encodings) {
-                    e.maxBitrateBps = maxBps
-                    e.minBitrateBps = maxBps / 3
-                    e.maxFramerate = fps
-                }
-                sender.setParameters(params)
-            } catch (e: Exception) {
-                // ตั้งบิตเรตไม่ได้ ใช้ค่าเริ่มต้น
-            }
+            peer.sender = pc.addTrack(t, listOf("game"))
+            applyBitrate(peer)
         }
 
         val channel = pc.createDataChannel("input", DataChannel.Init())
@@ -922,6 +1093,9 @@ class Streamer(
 
     private fun drop(id: String) {
         val p = peers.remove(id) ?: return
+        recent[p.name] = p.slot to (System.currentTimeMillis() + 5 * 60 * 1000L)
+        hasPeers = peers.isNotEmpty()
+        peers.values.forEach { applyBitrate(it) }
         held[p.slot]?.toList()?.forEach { dispatchInput(p.slot, it, false) }
         try { p.channel?.close() } catch (e: Exception) { }
         try { p.pc?.close() } catch (e: Exception) { }
@@ -981,8 +1155,10 @@ class Streamer(
         stopped = true
         peers.keys.toList().forEach { drop(it) }
         sig?.close()
-        main.removeCallbacks(grabTask)
+        tickHandler?.removeCallbacksAndMessages(null)
+        try { tickThread?.quitSafely() } catch (e: Exception) { }
         main.removeCallbacks(turnTicker)
+        main.removeCallbacks(statsTicker)
         try { source?.capturerObserver?.onCapturerStopped() } catch (e: Exception) { }
         try { grabThread?.quitSafely() } catch (e: Exception) { }
         try { track?.dispose() } catch (e: Exception) { }
@@ -1006,6 +1182,7 @@ class GameActivity : AppCompatActivity() {
     private var padAlpha = 0.55f
     private var padScale = 1f
     private var swapLocal = false
+    private var haptic = true
     private val ui = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(Dispatchers.Main)
     private val autosave = object : Runnable {
@@ -1030,6 +1207,7 @@ class GameActivity : AppCompatActivity() {
         padAlpha = settings.getInt("ui_alpha", 55) / 100f
         padScale = settings.getInt("ui_scale", 100) / 100f
         swapLocal = settings.getBoolean("swap_ab", false)
+        haptic = settings.getBoolean("haptic", true)
         if (settings.getBoolean("sustained", true)) {
             try { window.setSustainedPerformanceMode(true) } catch (e: Throwable) { }
         }
@@ -1127,7 +1305,7 @@ class GameActivity : AppCompatActivity() {
         scope.launch {
             try {
                 val bytes = v.serializeState()
-                stateFile(n).writeBytes(bytes)
+                withContext(Dispatchers.IO) { stateFile(n).writeBytes(bytes) }
                 toast("บันทึกสถานะช่อง $n แล้ว")
             } catch (e: Throwable) {
                 toast("บันทึกสถานะไม่สำเร็จ: ${e.message}")
@@ -1144,7 +1322,8 @@ class GameActivity : AppCompatActivity() {
         }
         scope.launch {
             try {
-                v.unserializeState(f.readBytes())
+                val data = withContext(Dispatchers.IO) { f.readBytes() }
+                v.unserializeState(data)
                 toast("โหลดสถานะช่อง $n แล้ว")
             } catch (e: Throwable) {
                 toast("โหลดสถานะไม่สำเร็จ: ${e.message}")
@@ -1161,7 +1340,7 @@ class GameActivity : AppCompatActivity() {
         scope.launch {
             try {
                 val bytes = v.serializeSRAM()
-                if (bytes.isNotEmpty()) sramFile().writeBytes(bytes)
+                if (bytes.isNotEmpty()) withContext(Dispatchers.IO) { sramFile().writeBytes(bytes) }
             } catch (e: Throwable) {
                 // เซฟไม่ได้ก็ออกต่อ
             }
@@ -1195,7 +1374,7 @@ class GameActivity : AppCompatActivity() {
                     10 -> {
                         AlertDialog.Builder(this)
                             .setTitle("บันทึกการเชื่อมต่อ")
-                            .setMessage(DebugLog.tail(30))
+                            .setMessage((streamer?.statsSummary()?.let { it + "\n\n" } ?: "") + DebugLog.tail(30))
                             .setPositiveButton("ปิด", null)
                             .show()
                     }
@@ -1214,6 +1393,31 @@ class GameActivity : AppCompatActivity() {
     }
 
     private var lastBlockToast = 0L
+
+    private val axisHeld = BooleanArray(6)
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (GamepadMap.isGamepad(event)) {
+            val idx = GamepadMap.index(event.keyCode)
+            val code = if (idx != null) PadMap.code(idx) else null
+            if (code != null) {
+                if (event.repeatCount == 0) press(code, event.action == KeyEvent.ACTION_DOWN)
+                return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if ((event.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK && event.action == MotionEvent.ACTION_MOVE) {
+            GamepadMap.processAxes(event, axisHeld) { idx, down ->
+                val c = PadMap.code(idx)
+                if (c != null) press(c, down)
+            }
+            return true
+        }
+        return super.onGenericMotionEvent(event)
+    }
 
     private fun press(code: Int, down: Boolean) {
         val s = streamer
@@ -1355,7 +1559,7 @@ class GameActivity : AppCompatActivity() {
         statusView.text = "กำลังเริ่มสตรีม…"
         val room = getSharedPreferences("dokapon", MODE_PRIVATE).getString("room", "DOKAPN") ?: "DOKAPN"
         val prefs = getSharedPreferences("dokapon", MODE_PRIVATE)
-        val fps = prefs.getInt("stream_fps", 30)
+        val fps = prefs.getInt("stream_fps", 30).let { if (it == 24) 20 else it }
         val pool = if ((prefs.getString("multitap", "auto") ?: "auto") == "enabled") 4 else 2
         // เกมสุ่มลำดับตาเดินเอง จึงไม่สุ่มช่องจอยซ้ำ: โฮสต์ = ผู้เล่น 1 เพื่อนเรียงตามลำดับที่เข้าห้อง
         val randomSeat = false
@@ -1409,6 +1613,7 @@ class GameActivity : AppCompatActivity() {
                 when (e.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
                         v.alpha = 1f
+                        if (haptic) v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                         press(code, true)
                     }
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -1508,6 +1713,7 @@ class PlayerActivity : AppCompatActivity() {
     private var padAlpha = 0.55f
     private var padScale = 1f
     private var swapLocal = false
+    private var haptic = true
     private var joinAttempts = 0
     private var joinName = ""
     private var hostSeen = false
@@ -1516,10 +1722,45 @@ class PlayerActivity : AppCompatActivity() {
     private var turnLock = false
     private var turnName = ""
     private var lastBlockToast = 0L
+    private var pingMs = -1
     private lateinit var endBtn: TextView
 
+    private val statsTick = object : Runnable {
+        override fun run() {
+            if (finished) return
+            pc?.getStats { r ->
+                val st = StatsUtil.summarize(r, false)
+                pingMs = st.pingMs
+                DebugLog.add("[player] ${st.text}")
+                main.post { refreshBadge() }
+            }
+            main.postDelayed(this, 4000)
+        }
+    }
+
+    /** เชื่อมต่อภาพหลุด: ออกแล้วเข้าห้องใหม่เอง (สูงสุด 3 ครั้ง) */
+    private fun retryJoin(reason: String) {
+        if (finished) return
+        val n = intent.getIntExtra("retry", 0)
+        if (n >= 3) {
+            fail("$reason (ลองเข้าห้องใหม่แล้ว 3 ครั้ง)")
+            return
+        }
+        show("$reason กำลังเข้าห้องใหม่ (${n + 1}/3)…")
+        val next = Intent(this, PlayerActivity::class.java)
+            .putExtra("room", intent.getStringExtra("room"))
+            .putExtra("name", intent.getStringExtra("name"))
+            .putExtra("retry", n + 1)
+        main.postDelayed({
+            if (finished) return@postDelayed
+            sig?.send("LEAVE", hostId, JSONObject())
+            finish()
+            startActivity(next)
+        }, 1500)
+    }
+
     private fun refreshBadge() {
-        badge.text = "ผู้เล่น ${mySlot + 1}" + if (turnLock && turnName.isNotEmpty()) " · ถึงตา: $turnName" else ""
+        badge.text = "ผู้เล่น ${mySlot + 1}" + (if (turnLock && turnName.isNotEmpty()) " · ถึงตา: $turnName" else "") + (if (pingMs >= 0) " · ${pingMs}ms" else "")
     }
 
     private fun onTurn(seat: Int, name: String, lock: Boolean) {
@@ -1573,6 +1814,7 @@ class PlayerActivity : AppCompatActivity() {
         padAlpha = settings.getInt("ui_alpha", 55) / 100f
         padScale = settings.getInt("ui_scale", 100) / 100f
         swapLocal = settings.getBoolean("swap_ab", false)
+        haptic = settings.getBoolean("haptic", true)
 
         val egl = EglBase.create()
         eglBase = egl
@@ -1743,10 +1985,15 @@ class PlayerActivity : AppCompatActivity() {
                 DebugLog.add("[player] ICE: $s")
                 main.post {
                     when (s) {
-                        PeerConnection.IceConnectionState.FAILED -> fail("เชื่อมต่อภาพไม่สำเร็จ ลองสลับ Wi-Fi/เน็ตมือถือ")
-                        PeerConnection.IceConnectionState.DISCONNECTED -> statusView.apply {
-                            text = "สัญญาณสะดุด กำลังพยายามต่อใหม่…"
-                            visibility = View.VISIBLE
+                        PeerConnection.IceConnectionState.FAILED -> retryJoin("เชื่อมต่อภาพไม่สำเร็จ")
+                        PeerConnection.IceConnectionState.DISCONNECTED -> {
+                            statusView.text = "สัญญาณสะดุด กำลังพยายามต่อใหม่…"
+                            statusView.visibility = View.VISIBLE
+                            main.postDelayed({
+                                if (!finished && pc?.iceConnectionState() == PeerConnection.IceConnectionState.DISCONNECTED) {
+                                    retryJoin("สัญญาณหลุด")
+                                }
+                            }, 12000)
                         }
                         PeerConnection.IceConnectionState.CONNECTED,
                         PeerConnection.IceConnectionState.COMPLETED -> statusView.visibility = View.GONE
@@ -1794,9 +2041,10 @@ class PlayerActivity : AppCompatActivity() {
                 if (r != null) {
                     try {
                         val m = r.javaClass.getMethod("setJitterBufferMinimumDelay", java.lang.Double::class.java)
-                        m.invoke(r, 0.0)
+                        m.invoke(r, 0.08)
+                        DebugLog.add("[player] jitter min delay = 0.08s")
                     } catch (e: Throwable) {
-                        // ไลบรารีเวอร์ชันนี้ไม่มีตัวเลือกนี้ ข้ามไป
+                        DebugLog.add("[player] ตั้ง jitter buffer ไม่ได้: ${e.javaClass.simpleName}")
                     }
                 }
                 val t = r?.track()
@@ -1809,6 +2057,8 @@ class PlayerActivity : AppCompatActivity() {
             }
         }) ?: return
         pc = c
+        main.removeCallbacks(statsTick)
+        main.postDelayed(statsTick, 4000)
 
         c.setRemoteDescription(object : SdpAdapter() {
             override fun onSetSuccess() {
@@ -1858,6 +2108,27 @@ class PlayerActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    private val axisHeld = BooleanArray(6)
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (GamepadMap.isGamepad(event)) {
+            val idx = GamepadMap.index(event.keyCode)
+            if (idx != null) {
+                if (event.repeatCount == 0) sendBtn(idx, event.action == KeyEvent.ACTION_DOWN)
+                return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if ((event.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK && event.action == MotionEvent.ACTION_MOVE) {
+            GamepadMap.processAxes(event, axisHeld) { idx, down -> sendBtn(idx, down) }
+            return true
+        }
+        return super.onGenericMotionEvent(event)
+    }
+
     // ---------- ส่งปุ่มให้โฮสต์ (รหัสปุ่มแบบ RetroPad) ----------
     private fun sendBtn(idx: Int, down: Boolean) {
         if (down && turnLock && turnSeat != mySlot) {
@@ -1894,6 +2165,7 @@ class PlayerActivity : AppCompatActivity() {
                 when (e.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
                         v.alpha = 1f
+                        if (haptic) v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                         sendBtn(idx, true)
                     }
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {

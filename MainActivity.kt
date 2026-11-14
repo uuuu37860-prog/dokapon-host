@@ -516,6 +516,7 @@ fun showSettingsDialog(a: AppCompatActivity) {
     toggle("โหมดประสิทธิภาพคงที่ (ช่วยลดอาการกระตุกเมื่อเครื่องร้อน)", "sustained", true)
     toggle("เปิดห้องให้เพื่อนเข้าอัตโนมัติเมื่อเริ่มเกม", "auto_room", true)
     toggle("ยอมรับเพื่อนอัตโนมัติ (ไม่ต้องกดยอมรับทุกครั้ง)", "auto_accept", false)
+    toggle("สั่นเบา ๆ เมื่อกดปุ่มบนจอ", "haptic", true)
     toggle("โหมดสลับตา (เฉพาะคนที่ถึงตากดปุ่มได้ มีปุ่ม \"จบตา\" ส่งต่อให้คนถัดไป)", "turn_lock", true)
     toggle("เพิ่มความคมชัดภาพสตรีม (ช่วยให้ตัวหนังสือและขอบภาพชัดขึ้น)", "sharpen", true)
     toggle("เข้ารหัสวิดีโอด้วยฮาร์ดแวร์ H.264 (ช่วยลดอาการกระตุก ถ้าภาพไม่ขึ้นให้ปิด)", "hw_codec", true)
@@ -538,14 +539,14 @@ fun showSettingsDialog(a: AppCompatActivity) {
     box.addView(qGroup)
 
     box.addView(label("สตรีม: เฟรมเรต (ลดลงถ้าเครื่องหน่วงตอนสตรีม)"))
-    val fpsOptions = listOf(15, 24, 30)
+    val fpsOptions = listOf(15, 20, 30)
     val group = RadioGroup(a)
     group.orientation = RadioGroup.HORIZONTAL
     fpsOptions.forEachIndexed { i, f ->
         val rb = RadioButton(a)
         rb.id = 1000 + i
         rb.text = "$f fps"
-        rb.isChecked = prefs.getInt("stream_fps", 30) == f
+        rb.isChecked = prefs.getInt("stream_fps", 30).let { if (it == 24) 20 else it } == f
         group.addView(rb)
     }
     group.setOnCheckedChangeListener { _, checkedId ->
